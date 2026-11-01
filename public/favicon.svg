@@ -1,0 +1,66 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#040814"/>
+      <stop offset="50%" stop-color="#0a1526"/>
+      <stop offset="100%" stop-color="#050a12"/>
+    </linearGradient>
+
+    <!-- Border Neon Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00F0FF"/>
+      <stop offset="60%" stop-color="#38BDF8"/>
+      <stop offset="100%" stop-color="#FFE600"/>
+    </linearGradient>
+
+    <!-- Electric Cyan Gradient -->
+    <linearGradient id="cyanGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#67e8f9"/>
+      <stop offset="100%" stop-color="#00F0FF"/>
+    </linearGradient>
+
+    <!-- TikTok Yellow Gradient -->
+    <linearGradient id="yellowGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#FFF066"/>
+      <stop offset="100%" stop-color="#FFE600"/>
+    </linearGradient>
+
+    <!-- Soft Glow Filter -->
+    <filter id="neonGlow" x="-20%" y="-20%" width="140%" height="140%">
+      <feGaussianBlur stdDeviation="1.5" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+
+  <!-- Outer Rounded Badge -->
+  <rect x="2" y="2" width="60" height="60" rx="16" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="2.5"/>
+
+  <!-- Subtle Inner Ring Highlight -->
+  <rect x="4.5" y="4.5" width="55" height="55" rx="13.5" fill="none" stroke="#00F0FF" stroke-opacity="0.15" stroke-width="1"/>
+
+  <!-- Group with Neon Glow -->
+  <g filter="url(#neonGlow)">
+    <!-- Video Camera Body (Electric Blue) -->
+    <rect x="12" y="20" width="22" height="24" rx="4.5" fill="url(#cyanGrad)" />
+    
+    <!-- Camera Lens Cone -->
+    <path d="M34 26 L43 20.5 Q45 19 45 22 L45 42 Q45 45 43 43.5 L34 38 Z" fill="url(#cyanGrad)" />
+    
+    <!-- Camera Aperture Detail -->
+    <circle cx="23" cy="32" r="5" fill="#06101d" stroke="#00F0FF" stroke-width="1.5"/>
+    <circle cx="23" cy="32" r="2.2" fill="#FFE600" />
+    <circle cx="21.5" cy="30.5" r="1" fill="#ffffff" />
+
+    <!-- Audio Wave Bars (TikTok Yellow Neon) -->
+    <!-- Bar 1 -->
+    <rect x="47" y="27" width="2.5" height="10" rx="1.25" fill="url(#yellowGrad)"/>
+    <!-- Bar 2 (Peak) -->
+    <rect x="51.5" y="22" width="2.5" height="20" rx="1.25" fill="url(#yellowGrad)"/>
+    <!-- Bar 3 -->
+    <rect x="56" y="29" width="2.5" height="6" rx="1.25" fill="url(#yellowGrad)"/>
+  </g>
+
+  <!-- Corner Star Accent -->
+  <path d="M16 13 L17.2 15.8 L20 17 L17.2 18.2 L16 21 L14.8 18.2 L12 17 L14.8 15.8 Z" fill="#FFE600" opacity="0.9"/>
+</svg>

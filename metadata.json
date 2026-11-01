@@ -1,0 +1,6 @@
+{
+  "name": "CineRecap Myanmar - Movie Recap Hub",
+  "description": "မြန်မာဘာသာဖြင့် ရုပ်ရှင်ဇာတ်လမ်းအကျဉ်းများ၊ ဇာတ်ကွက်သုံးသပ်ချက်များနှင့် AI Movie Recap ဖန်တီးစနစ်",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
