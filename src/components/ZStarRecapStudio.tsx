@@ -2,7 +2,7 @@
 import { Play, Pause, Snowflake, Type, Palette, Music, Upload, RefreshCw, Sparkles, AlertCircle } from 'lucide-react';
 
 export default function ZStarRecapStudio() {
-  const [activeTab, setActiveTab] = useState<'script' | 'voice' | 'editor'>('editor');
+  const [activeTab, setActiveTab] = useState<'script' | 'voice' | 'editor'>('script');
   const [activeTool, setActiveTool] = useState<string | null>(null);
   
   // API & Processing States
@@ -266,59 +266,4 @@ export default function ZStarRecapStudio() {
                       { name: 'Vintage', value: 'sepia(50%) contrast(90%)' },
                       { name: 'B&W', value: 'grayscale(100%)' },
                     ].map((f) => (
-                      <button key={f.name} onClick={() => setFilter(f.value)} className={`px-3 py-1.5 rounded-lg border text-xs whitespace-nowrap ${filter === f.value ? 'border-cyan-400 bg-cyan-950 text-cyan-300' : 'border-slate-700 bg-slate-800 text-slate-300'}`}>
-                        {f.name}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {activeTool === 'audio' && (
-                <div className="space-y-2">
-                  <div className="flex justify-between items-center text-slate-300 font-semibold">
-                    <span>🎵 Audio & Volume</span>
-                    <button onClick={() => setActiveTool(null)} className="text-cyan-400 font-bold">Done</button>
-                  </div>
-                  <div>
-                    <label className="text-slate-400 block mb-1">Volume ({volume}%)</label>
-                    <input type="range" min="0" max="100" value={volume} onChange={(e) => setVolume(Number(e.target.value))} className="w-full accent-cyan-400" />
-                  </div>
-                </div>
-              )}
-
-              {activeTool === 'freeze' && (
-                <div className="flex justify-between items-center py-2">
-                  <span className="text-slate-300 font-semibold">❄️ Frame Frozen for 3 Seconds</span>
-                  <button onClick={() => setActiveTool(null)} className="bg-cyan-500 text-black px-3 py-1 rounded font-bold">Apply</button>
-                </div>
-              )}
-            </div>
-          )}
-
-          {/* Main Bottom Bar Buttons */}
-          <div className="p-3 flex justify-around items-center bg-slate-900">
-            <button onClick={() => setActiveTool(activeTool === 'freeze' ? null : 'freeze')} className={`flex flex-col items-center gap-1 min-w-[60px] ${activeTool === 'freeze' ? 'text-cyan-400' : 'text-slate-400'}`}>
-              <Snowflake className="w-5 h-5" />
-              <span className="text-[10px]">Freeze</span>
-            </button>
-            <button onClick={() => setActiveTool(activeTool === 'subtitles' ? null : 'subtitles')} className={`flex flex-col items-center gap-1 min-w-[60px] ${activeTool === 'subtitles' ? 'text-cyan-400' : 'text-slate-400'}`}>
-              <Type className="w-5 h-5" />
-              <span className="text-[10px]">Subtitles</span>
-            </button>
-            <button onClick={() => setActiveTool(activeTool === 'filters' ? null : 'filters')} className={`flex flex-col items-center gap-1 min-w-[60px] ${activeTool === 'filters' ? 'text-cyan-400' : 'text-slate-400'}`}>
-              <Palette className="w-5 h-5" />
-              <span className="text-[10px]">Filters</span>
-            </button>
-            <button onClick={() => setActiveTool(activeTool === 'audio' ? null : 'audio')} className={`flex flex-col items-center gap-1 min-w-[60px] ${activeTool === 'audio' ? 'text-cyan-400' : 'text-slate-400'}`}>
-              <Music className="w-5 h-5" />
-              <span className="text-[10px]">Audio</span>
-            </button>
-          </div>
-
-        </div>
-      )}
-
-    </div>
-  );
-}
+                      <button key={f
