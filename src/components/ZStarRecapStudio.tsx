@@ -38,6 +38,7 @@ import {
   MessageSquare,
   Languages,
   Key,
+  ExternalLink,
   ArrowLeft,
   ArrowRight,
   Palette,
@@ -408,11 +409,16 @@ export const MULTILINGUAL_VOICE_GROUPS: LanguageVoiceGroup[] = [
   },
 ];
 
+// Top-level module-level memory persistence for active Gemini API key (immune to React component re-mounts, unmounts, and closure staleness)
+let moduleActiveGeminiKey = '';
+
 export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
   onRecapReady = () => {},
   initialRecap = null,
   onOpenTeleprompter,
 }) => {
+  // Stable reference for the verified Gemini API key
+  const verifiedKeyRef = useRef<string>('');
   // Script direct editing & Live Studio Summarization states
   const [isEditingScript, setIsEditingScript] = useState(false);
   const [editableScriptText, setEditableScriptText] = useState('');
@@ -452,7 +458,6 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string>('');
   const [videoTitle, setVideoTitle] = useState<string>('');
-  const [customVideoPlot, setCustomVideoPlot] = useState<string>('');
 
   // Tune options
   const [translationLanguage, setTranslationLanguage] = useState<'myanmar' | 'english'>('myanmar');
@@ -764,27 +769,365 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
 
   // Agreement checkboxes (checked by default as in screenshot)
   const [agreeTerms1, setAgreeTerms1] = useState(true);
-  // User Custom Gemini API Key state (safely accessed to prevent iframe SecurityError crashes)
+
+  // Clean and sanitize API key string (strips accidental Bearer prefix, surrounding quotes, whitespace)
+  const sanitizeApiKey = (k?: string | null): string => {
+    if (!k) return '';
+    let str = String(k).trim();
+    str = str.replace(/^Bearer\s+/i, '');
+    str = str.replace(/^["'`]|["'`]$/g, '').trim();
+    return str;
+  };
+
+  // Helper to validate whether a key string looks like a legitimate API key (not an internal AQ. access token or placeholder)
+  const isKeyFormatValid = (k?: string | null): boolean => {
+    if (!k) return false;
+    const str = sanitizeApiKey(k);
+    if (!str || str.length < 15) return false;
+    if (/^(your_gemini_api_key_here|your_api_key|undefined|null|placeholder|gemini_api_key|vite_gemini_api_key|api_key|custom_gemini_api_key)$/i.test(str)) return false;
+    if (str.startsWith('AQ.')) return false; // Ignore internal GCP access tokens
+    return true;
+  };
+
+  // Gemini API Key state (initialized from module cache, window, localStorage, import.meta.env, or process.env)
   const [geminiApiKey, setGeminiApiKey] = useState<string>(() => {
+    if (moduleActiveGeminiKey && isKeyFormatValid(moduleActiveGeminiKey)) {
+      return sanitizeApiKey(moduleActiveGeminiKey);
+    }
     try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        return window.localStorage.getItem('cinerecap_custom_gemini_key') || '';
+      if (typeof window !== 'undefined' && (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__) {
+        const winKey = String((window as any).__ZSTAR_ACTIVE_GEMINI_KEY__);
+        if (isKeyFormatValid(winKey)) return sanitizeApiKey(winKey);
       }
-    } catch {
-      // Sandboxed iframe without storage access
+    } catch (_) {}
+    try {
+      if (typeof window !== 'undefined') {
+        const storageKeys = ['cinerecap_custom_gemini_key', 'gemini_api_key', 'GEMINI_API_KEY', 'custom_gemini_api_key', 'geminiApiKey', 'active_gemini_key', 'GEMINI_KEY'];
+        if (window.localStorage) {
+          for (const k of storageKeys) {
+            const stored = window.localStorage.getItem(k);
+            if (stored && isKeyFormatValid(stored)) return sanitizeApiKey(stored);
+          }
+        }
+        if (window.sessionStorage) {
+          for (const k of storageKeys) {
+            const stored = window.sessionStorage.getItem(k);
+            if (stored && isKeyFormatValid(stored)) return sanitizeApiKey(stored);
+          }
+        }
+      }
+    } catch (_) {}
+    const envKey =
+      (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GEMINI_API_KEY) ||
+      (typeof process !== 'undefined' && (process.env?.GEMINI_API_KEY || (process.env as any)?.VITE_GEMINI_API_KEY)) ||
+      '';
+    if (isKeyFormatValid(envKey)) {
+      return sanitizeApiKey(envKey);
     }
     return '';
   });
   const [showKeyText, setShowKeyText] = useState(false);
+  const [keyInputFeedback, setKeyInputFeedback] = useState<string | null>(null);
+  const [isVerifyingKey, setIsVerifyingKey] = useState(false);
+  const [keyVerificationStatus, setKeyVerificationStatus] = useState<{
+    verified: boolean;
+    message: string;
+    model?: string;
+    verifiedKey?: string;
+  } | null>(null);
+
+  // Retrieve active Gemini API Key with module memory, Ref, window global, verification status, DOM element, multi-storage fallback, and session support
+  const getActiveGeminiApiKey = (): string => {
+    // 1. Module-level in-memory cache (highest resilience across unmounts / re-renders)
+    if (moduleActiveGeminiKey && isKeyFormatValid(moduleActiveGeminiKey)) {
+      return sanitizeApiKey(moduleActiveGeminiKey);
+    }
+
+    // 2. Component Ref (resilient to render timing and async closures)
+    if (verifiedKeyRef.current && isKeyFormatValid(verifiedKeyRef.current)) {
+      return sanitizeApiKey(verifiedKeyRef.current);
+    }
+
+    // 3. Window global
+    try {
+      if (typeof window !== 'undefined' && (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__) {
+        const winKey = String((window as any).__ZSTAR_ACTIVE_GEMINI_KEY__);
+        if (isKeyFormatValid(winKey)) return sanitizeApiKey(winKey);
+      }
+    } catch (_) {}
+
+    // 4. Verified key from verification status
+    if (keyVerificationStatus?.verified && keyVerificationStatus?.verifiedKey && isKeyFormatValid(keyVerificationStatus.verifiedKey)) {
+      return sanitizeApiKey(keyVerificationStatus.verifiedKey);
+    }
+
+    // 5. Component React state
+    if (geminiApiKey && isKeyFormatValid(geminiApiKey)) {
+      return sanitizeApiKey(geminiApiKey);
+    }
+
+    // 6. DOM input element
+    try {
+      if (typeof document !== 'undefined') {
+        const el = document.getElementById('gemini-api-key-input') as HTMLInputElement | null;
+        if (el && el.value && isKeyFormatValid(el.value)) {
+          return sanitizeApiKey(el.value);
+        }
+      }
+    } catch (_) {}
+
+    // 7. Multi-storage keys in localStorage / sessionStorage
+    try {
+      if (typeof window !== 'undefined') {
+        const storageKeys = ['cinerecap_custom_gemini_key', 'gemini_api_key', 'GEMINI_API_KEY', 'custom_gemini_api_key', 'geminiApiKey', 'active_gemini_key', 'GEMINI_KEY'];
+        if (window.localStorage) {
+          for (const storageKey of storageKeys) {
+            const stored = window.localStorage.getItem(storageKey);
+            if (stored && isKeyFormatValid(stored)) return sanitizeApiKey(stored);
+          }
+        }
+        if (window.sessionStorage) {
+          for (const storageKey of storageKeys) {
+            const stored = window.sessionStorage.getItem(storageKey);
+            if (stored && isKeyFormatValid(stored)) return sanitizeApiKey(stored);
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 8. Env vars
+    try {
+      if (typeof import.meta !== 'undefined' && (import.meta as any).env?.VITE_GEMINI_API_KEY) {
+        const k = String((import.meta as any).env.VITE_GEMINI_API_KEY).trim();
+        if (isKeyFormatValid(k)) return sanitizeApiKey(k);
+      }
+    } catch (_) {}
+
+    return '';
+  };
 
   const handleUpdateApiKey = (key: string) => {
-    setGeminiApiKey(key);
+    const cleaned = sanitizeApiKey(key);
+    if (cleaned && isKeyFormatValid(cleaned)) {
+      moduleActiveGeminiKey = cleaned;
+      verifiedKeyRef.current = cleaned;
+      try {
+        if (typeof window !== 'undefined') {
+          (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__ = cleaned;
+        }
+      } catch (_) {}
+    } else if (!cleaned) {
+      moduleActiveGeminiKey = '';
+      verifiedKeyRef.current = '';
+      try {
+        if (typeof window !== 'undefined') {
+          delete (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__;
+        }
+      } catch (_) {}
+    }
+
+    setGeminiApiKey(cleaned);
+    setErrorMsg(null); // Clear error state immediately when user edits/pastes key
+    setKeyInputFeedback(cleaned ? '✓ API Key ထည့်သွင်းသိမ်းဆည်းပြီးပါပြီ' : null);
     try {
-      if (typeof window !== 'undefined' && window.localStorage) {
-        window.localStorage.setItem('cinerecap_custom_gemini_key', key.trim());
+      if (typeof window !== 'undefined') {
+        const storageKeys = ['cinerecap_custom_gemini_key', 'gemini_api_key', 'GEMINI_API_KEY', 'custom_gemini_api_key', 'geminiApiKey', 'active_gemini_key', 'GEMINI_KEY'];
+        if (window.localStorage) {
+          if (cleaned) {
+            for (const k of storageKeys) window.localStorage.setItem(k, cleaned);
+          } else {
+            for (const k of storageKeys) window.localStorage.removeItem(k);
+          }
+        }
+        if (window.sessionStorage) {
+          if (cleaned) {
+            for (const k of storageKeys) window.sessionStorage.setItem(k, cleaned);
+          } else {
+            for (const k of storageKeys) window.sessionStorage.removeItem(k);
+          }
+        }
       }
-    } catch {
-      // Sandboxed iframe without storage access
+    } catch (_) {}
+
+    // Synchronize to backend in-memory cache and disk persistence
+    if (cleaned && isKeyFormatValid(cleaned)) {
+      fetch('/api/gemini/set-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-gemini-api-key': cleaned,
+        },
+        body: JSON.stringify({ apiKey: cleaned }),
+      }).catch(() => {});
+    } else if (!cleaned) {
+      fetch('/api/gemini/clear-key', { method: 'POST' }).catch(() => {});
+    }
+
+    if (cleaned) {
+      setTimeout(() => setKeyInputFeedback(null), 3000);
+    }
+  };
+
+  // Live test API key against backend /api/gemini/verify-key
+  const handleVerifyApiKey = async (explicitKey?: string) => {
+    const keyToTest = sanitizeApiKey(explicitKey || getActiveGeminiApiKey());
+    if (!keyToTest) {
+      setKeyVerificationStatus({ verified: false, message: 'Gemini API Key ထည့်သွင်းပေးပါ' });
+      return;
+    }
+
+    // Immediately commit candidate key into fast memory tiers
+    moduleActiveGeminiKey = keyToTest;
+    verifiedKeyRef.current = keyToTest;
+    try {
+      if (typeof window !== 'undefined') {
+        (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__ = keyToTest;
+      }
+    } catch (_) {}
+
+    setIsVerifyingKey(true);
+    setKeyVerificationStatus(null);
+    try {
+      // 1. First ensure backend session cache and disk persistence receive the exact key
+      await fetch('/api/gemini/set-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-gemini-api-key': keyToTest,
+        },
+        body: JSON.stringify({ apiKey: keyToTest }),
+      }).catch(() => {});
+
+      // 2. Then call verify-key passing the key both in header and body
+      const res = await fetch('/api/gemini/verify-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-gemini-api-key': keyToTest,
+        },
+        body: JSON.stringify({ apiKey: keyToTest }),
+      });
+      const data = await res.json();
+      if (res.ok && data.success) {
+        // Commit verified key into React state, memory tiers, and storage
+        moduleActiveGeminiKey = keyToTest;
+        verifiedKeyRef.current = keyToTest;
+        try {
+          if (typeof window !== 'undefined') {
+            (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__ = keyToTest;
+          }
+        } catch (_) {}
+        handleUpdateApiKey(keyToTest);
+        setKeyVerificationStatus({
+          verified: true,
+          verifiedKey: keyToTest,
+          message: '✓ API Key မှန်ကန်စွာ ချိတ်ဆက်ပြီးပါပြီ',
+          model: data.modelUsed || 'gemini-3.8-flash',
+        });
+      } else {
+        const rawErr = data?.error || data?.message;
+        const errText = typeof rawErr === 'object' && rawErr !== null
+          ? String(rawErr.message || rawErr.error || JSON.stringify(rawErr))
+          : String(rawErr || 'API Key ချိတ်ဆက်မှု မအောင်မြင်ပါ');
+        setKeyVerificationStatus({
+          verified: false,
+          message: errText,
+        });
+      }
+    } catch (err: any) {
+      setKeyVerificationStatus({
+        verified: false,
+        message: err.message || 'API verification connection error',
+      });
+    } finally {
+      setIsVerifyingKey(false);
+    }
+  };
+
+  // Synchronize key on initial load (bidirectional: client -> server or server -> client)
+  useEffect(() => {
+    const syncActiveKey = async () => {
+      const clientKey = getActiveGeminiApiKey();
+      if (clientKey) {
+        if (!geminiApiKey) setGeminiApiKey(clientKey);
+        fetch('/api/gemini/set-key', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-gemini-api-key': clientKey,
+          },
+          body: JSON.stringify({ apiKey: clientKey }),
+        }).catch(() => {});
+      } else {
+        // If client storage doesn't have it, check if server has an active persisted key
+        try {
+          const res = await fetch('/api/gemini/get-key');
+          if (res.ok) {
+            const data = await res.json();
+            if (data?.hasKey && data?.key && isKeyFormatValid(data.key)) {
+              const cleaned = sanitizeApiKey(data.key);
+              setGeminiApiKey(cleaned);
+              if (typeof window !== 'undefined' && window.localStorage) {
+                window.localStorage.setItem('cinerecap_custom_gemini_key', cleaned);
+                window.localStorage.setItem('gemini_api_key', cleaned);
+              }
+            }
+          }
+        } catch (_) {}
+      }
+    };
+    syncActiveKey();
+
+    // Check again after 1 second to handle browser autofill
+    const timer = setTimeout(syncActiveKey, 1000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  // Smooth retry mechanism with exponential backoff specifically for 503 Service Unavailable errors
+  const fetchWith503Retry = async (
+    url: string,
+    options: RequestInit,
+    onRetryStatus?: (retryCount: number, delayMs: number) => void,
+    maxRetries = 3,
+    initialDelayMs = 1500
+  ): Promise<Response> => {
+    let attempt = 0;
+    let delay = initialDelayMs;
+
+    while (true) {
+      try {
+        const res = await fetch(url, options);
+
+        // If 503 Service Unavailable, inspect and retry with exponential backoff
+        if (res.status === 503 && attempt < maxRetries) {
+          attempt++;
+          if (onRetryStatus) {
+            onRetryStatus(attempt, delay);
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.round(delay * 2); // Exponential backoff: 1.5s -> 3s -> 6s
+          continue;
+        }
+
+        return res;
+      } catch (networkErr: any) {
+        // If aborted or out of retries, rethrow
+        if (options.signal?.aborted) {
+          throw networkErr;
+        }
+        const msg = String(networkErr?.message || networkErr || '').toLowerCase();
+        const is503Like = msg.includes('503') || msg.includes('service unavailable');
+        if (is503Like && attempt < maxRetries) {
+          attempt++;
+          if (onRetryStatus) {
+            onRetryStatus(attempt, delay);
+          }
+          await new Promise((resolve) => setTimeout(resolve, delay));
+          delay = Math.round(delay * 2);
+          continue;
+        }
+        throw networkErr;
+      }
     }
   };
 
@@ -826,10 +1169,48 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i];
   };
 
+  const formatSecondsToTime = (seconds: number): string => {
+    const s = Math.max(0, Math.floor(seconds || 0));
+    const mins = Math.floor(s / 60);
+    const secs = s % 60;
+    return `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  };
+
   // Voice preview state
   const [isPlayingVoice, setIsPlayingVoice] = useState(false);
   const [copiedScript, setCopiedScript] = useState(false);
   const [isSyncNarrationActive, setIsSyncNarrationActive] = useState(false);
+
+  // CapCut-style Bottom Toolbar & Sub-bar States (Requirement 2 & 3)
+  const [activeCapCutTool, setActiveCapCutTool] = useState<'freeze' | 'subtitles' | 'filters' | 'audio' | 'canvas' | null>('subtitles');
+  const [isFreezeActive, setIsFreezeActive] = useState(false);
+  const [freezeDurationSec, setFreezeDurationSec] = useState(3);
+  const [freezeSnapshotUrl, setFreezeSnapshotUrl] = useState<string | null>(null);
+  const [subtitlePositionPreset, setSubtitlePositionPreset] = useState<'top' | 'center' | 'bottom'>('bottom');
+  const [subtitleOffsetX, setSubtitleOffsetX] = useState(0);
+  const [subtitleOffsetY, setSubtitleOffsetY] = useState(0);
+
+  const handleFreezeFrame = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext('2d');
+    if (ctx) {
+      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+      const snap = canvas.toDataURL('image/jpeg', 0.9);
+      setFreezeSnapshotUrl(snap);
+      setIsFreezeActive(true);
+      video.pause();
+      setIsPlaying(false);
+      setExportSuccessMsg(`ဗီဒီယို Frame အား ${freezeDurationSec} စက္ကန့် ရပ်တန့် (Freeze) ပြုလုပ်ထားပါသည်`);
+      setTimeout(() => {
+        setIsFreezeActive(false);
+        setFreezeSnapshotUrl(null);
+      }, freezeDurationSec * 1000);
+    }
+  };
 
   // Export Render Modal state
   const [isExportModalOpen, setIsExportModalOpen] = useState(false);
@@ -1176,18 +1557,25 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     try {
       const frames = (framesToUse || sampledFrames).slice(0, 3).map((f) => f.dataUrl);
 
-      const res = await fetch('/api/recap/detect-genre', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(geminiApiKey ? { 'x-gemini-api-key': geminiApiKey.trim() } : {}),
+      const activeKey = getActiveGeminiApiKey();
+      const res = await fetchWith503Retry(
+        '/api/recap/detect-genre',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(activeKey ? { 'x-gemini-api-key': activeKey } : {}),
+          },
+          body: JSON.stringify({
+            movieTitle: titleToDetect,
+            frameImages: frames,
+            apiKey: activeKey || undefined,
+          }),
         },
-        body: JSON.stringify({
-          movieTitle: titleToDetect,
-          frameImages: frames,
-          apiKey: geminiApiKey.trim() || undefined,
-        }),
-      });
+        undefined,
+        2,
+        1000
+      );
 
       const data = await res.json();
       if (data.success && data.detected) {
@@ -1365,65 +1753,160 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     }
   };
 
-  // Sample Keyframes from Video via Canvas (Optimized memory for large videos & full-length movies)
-  const sampleFramesFromVideo = async (requestedCount?: number) => {
+  // Helper to ensure video element is ready for frame extraction (readyState >= 2 HAVE_CURRENT_DATA)
+  const waitForVideoReady = (video: HTMLVideoElement, maxWaitMs = 6000): Promise<boolean> => {
+    return new Promise((resolve) => {
+      if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+        return resolve(true);
+      }
+      let timer: any = null;
+      const onReady = () => {
+        if (video.readyState >= 2 && video.videoWidth > 0 && video.videoHeight > 0) {
+          cleanup();
+          resolve(true);
+        }
+      };
+      const cleanup = () => {
+        if (timer) clearTimeout(timer);
+        video.removeEventListener('loadedmetadata', onReady);
+        video.removeEventListener('loadeddata', onReady);
+        video.removeEventListener('canplay', onReady);
+      };
+      timer = setTimeout(() => {
+        cleanup();
+        resolve(video.readyState >= 1 && (video.videoWidth > 0 || video.duration > 0));
+      }, maxWaitMs);
+      video.addEventListener('loadedmetadata', onReady);
+      video.addEventListener('loadeddata', onReady);
+      video.addEventListener('canplay', onReady);
+    });
+  };
+
+  // Sample Keyframes from Video via Canvas (Robust 5-keyframe extraction, max 640px, 0.5 JPEG quality)
+  const sampleFramesFromVideo = async (requestedCount = 5): Promise<SampledFrame[]> => {
     const video = videoRef.current;
-    const canvas = canvasRef.current;
-    if (!video || !canvas) return;
+    let canvas = canvasRef.current;
+    if (!video) {
+      console.warn('sampleFramesFromVideo: No HTML5 Video element loaded');
+      return [];
+    }
+
+    if (!canvas) {
+      canvas = document.createElement('canvas');
+    }
 
     setIsSamplingFrames(true);
     setSamplingProgress(0);
 
-    const vidDuration = video.duration || 240;
-    // Calculate balanced keyframes for movies (15 to 20 keyframes)
-    let targetCount = requestedCount || 16;
-    if (!requestedCount || requestedCount < 15) {
-      if (vidDuration >= 1800) {
-        targetCount = 20; // 20 keyframes for 30-min to 2-hour full-length movies
-      } else if (vidDuration >= 180) {
-        targetCount = 18; // 18 keyframes for ~3-10 minute videos
-      } else if (vidDuration >= 90) {
-        targetCount = 15;
-      } else {
-        targetCount = 12;
-      }
-    }
-    targetCount = Math.min(20, Math.max(12, targetCount));
-
-    const frames: SampledFrame[] = [];
-    const step = vidDuration / (targetCount + 1);
-
-    const seekTo = (time: number) => {
-      return new Promise<void>((resolve) => {
-        let timer: any = null;
-        const onSeeked = () => {
-          if (timer) clearTimeout(timer);
-          video.removeEventListener('seeked', onSeeked);
-          resolve();
-        };
-        // Safety timeout so large movie seeks never freeze the UI
-        timer = setTimeout(() => {
-          video.removeEventListener('seeked', onSeeked);
-          resolve();
-        }, 2500);
-        video.addEventListener('seeked', onSeeked);
-        video.currentTime = Math.min(Math.max(0.2, time), Math.max(0.2, vidDuration - 0.2));
-      });
-    };
-
     try {
+      // 1. Wait for video element metadata/data to be populated
+      await waitForVideoReady(video, 4000);
+
+      const vidDuration = video.duration && !isNaN(video.duration) && video.duration > 0
+        ? video.duration
+        : (duration || 240);
+
+      // Exactly maximum 5 keyframes evenly spaced across the video duration
+      const targetCount = Math.min(5, Math.max(2, requestedCount || 5));
+      const frames: SampledFrame[] = [];
+      const step = vidDuration / (targetCount + 1);
+
+      // Robust seekTo helper with explicit seeked event listener so empty black frames are not captured
+      const seekTo = (targetTime: number): Promise<boolean> => {
+        return new Promise((resolve) => {
+          let timeoutId: any = null;
+          let settled = false;
+
+          const handleSeeked = () => {
+            if (settled) return;
+            settled = true;
+            if (timeoutId) clearTimeout(timeoutId);
+            video.removeEventListener('seeked', handleSeeked);
+            video.removeEventListener('error', handleError);
+            // Double requestAnimationFrame ensures video frame is fully decoded and rendered in GPU
+            requestAnimationFrame(() => {
+              requestAnimationFrame(() => {
+                resolve(true);
+              });
+            });
+          };
+
+          const handleError = () => {
+            if (settled) return;
+            settled = true;
+            if (timeoutId) clearTimeout(timeoutId);
+            video.removeEventListener('seeked', handleSeeked);
+            video.removeEventListener('error', handleError);
+            resolve(false);
+          };
+
+          // 2500ms safety timeout per seek so high-bitrate movies never hang indefinitely
+          timeoutId = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            video.removeEventListener('seeked', handleSeeked);
+            video.removeEventListener('error', handleError);
+            resolve(true);
+          }, 2500);
+
+          video.addEventListener('seeked', handleSeeked, { once: true });
+          video.addEventListener('error', handleError, { once: true });
+
+          const clampedTime = Math.min(Math.max(0.2, targetTime), Math.max(0.2, vidDuration - 0.2));
+          try {
+            video.currentTime = clampedTime;
+          } catch (seekErr) {
+            console.warn('Direct video seek error:', seekErr);
+            handleSeeked();
+          }
+        });
+      };
+
+      // Scale down image to max width/height of 640px using canvas
+      const vWidth = video.videoWidth || 640;
+      const vHeight = video.videoHeight || 360;
+      const maxDim = 640;
+      let targetWidth = vWidth;
+      let targetHeight = vHeight;
+
+      if (targetWidth > maxDim || targetHeight > maxDim) {
+        if (targetWidth >= targetHeight) {
+          targetHeight = Math.round((targetHeight * maxDim) / targetWidth);
+          targetWidth = maxDim;
+        } else {
+          targetWidth = Math.round((targetWidth * maxDim) / targetHeight);
+          targetHeight = maxDim;
+        }
+      }
+
+      // Ensure canvas has valid dimensions
+      canvas.width = Math.max(160, targetWidth);
+      canvas.height = Math.max(90, targetHeight);
+      const ctx = canvas.getContext('2d', { willReadFrequently: true });
+
+      if (!ctx) {
+        console.warn('Canvas 2D rendering context unavailable');
+        return [];
+      }
+
       for (let i = 1; i <= targetCount; i++) {
         const time = i * step;
         await seekTo(time);
 
-        canvas.width = 320;
-        canvas.height = 180;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-          // 0.65 JPEG quality produces ultra-lightweight keyframe payload without quality loss for AI vision
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.65);
+        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
 
+        // Compress to 'image/jpeg' with 0.5 quality to keep payload small
+        let dataUrl = '';
+        try {
+          dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+        } catch (canvasErr) {
+          console.warn('Canvas toDataURL compression error:', canvasErr);
+        }
+
+        // Verify valid non-empty JPEG header and reasonable size (> 400 bytes)
+        const isValidJpeg = dataUrl && dataUrl.startsWith('data:image/jpeg;base64,') && dataUrl.length > 400;
+
+        if (isValidJpeg) {
           const mins = Math.floor(time / 60);
           const secs = Math.floor(time % 60);
           const formatted = `${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
@@ -1436,26 +1919,40 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
             label: `Keyframe #${i} (${formatted})`,
           });
         }
+
         setSamplingProgress(Math.round((i / targetCount) * 100));
       }
 
+      // If frame extraction yields empty frames, do not throw - log warning and gracefully return empty array
+      if (frames.length === 0) {
+        console.warn('Canvas frame extraction returned 0 frames; falling back to video metadata/audio analysis');
+      }
+
       setSampledFrames(frames);
-      // Re-evaluate genre with actual sampled visual frames
+
       if (frames.length > 0) {
         detectGenreWithGemini(videoTitle, frames);
       }
-    } catch (err) {
-      console.warn('Frame sampling error:', err);
+
+      return frames;
+    } catch (err: any) {
+      // Graceful fallback without breaking execution
+      console.warn('Frame sampling caught error; proceeding with metadata/audio fallback:', err);
+      return [];
     } finally {
       setIsSamplingFrames(false);
-      video.currentTime = 0;
-      // RAM buffer disposal for canvas (Requirement 8)
-      const ctx = canvas.getContext('2d');
-      if (ctx) {
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
+      try {
+        video.currentTime = 0;
+      } catch (_) {}
+      // RAM buffer disposal for canvas
+      if (canvas) {
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+        }
+        canvas.width = 1;
+        canvas.height = 1;
       }
-      canvas.width = 1;
-      canvas.height = 1;
     }
   };
 
@@ -1478,19 +1975,26 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
   ) => {
     setIsLoadingVoiceoverGuide(true);
     try {
-      const res = await fetch('/api/video/generate-voiceover', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(geminiApiKey ? { 'x-gemini-api-key': geminiApiKey.trim() } : {}),
+      const activeKey = getActiveGeminiApiKey();
+      const res = await fetchWith503Retry(
+        '/api/video/generate-voiceover',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(activeKey ? { 'x-gemini-api-key': activeKey } : {}),
+          },
+          body: JSON.stringify({
+            scriptSegments: segments,
+            movieTitle: title || 'Video Story',
+            tone: tone || 'dramatic',
+            apiKey: activeKey || undefined,
+          }),
         },
-        body: JSON.stringify({
-          scriptSegments: segments,
-          movieTitle: title || 'Video Story',
-          tone: tone || 'dramatic',
-          apiKey: geminiApiKey.trim() || undefined,
-        }),
-      });
+        undefined,
+        2,
+        1000
+      );
       const data = await res.json();
       if (data.success && data.guide) {
         setVoiceoverGuide(data.guide);
@@ -1603,13 +2107,47 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
 
   // Video-to-Script Multimodal Video & Audio Analysis with Real-time Active Progress
   const handleAnalyzeVideo = async () => {
+    // 1. Immediately clear old error state so UI unfreezes on every click
+    setErrorMsg(null);
+
     if (!videoUrl && !videoFile) {
       setErrorMsg('ကျေးဇူးပြု၍ Video သို့မဟုတ် Audio ဖိုင်တစ်ခု ဦးစွာ တင်ပေးပါ (Please upload a video or audio file first)');
       return;
     }
 
-    // CLEAN ERROR RETRY HANDLER:
-    // Automatically clear old timeout state and abort any pending stream to trigger fresh request
+    let activeApiKey = getActiveGeminiApiKey();
+    if (!activeApiKey) {
+      // Check if server already holds the active key verified via Test Key / set-key
+      try {
+        const keyRes = await fetch('/api/gemini/get-key');
+        if (keyRes.ok) {
+          const keyData = await keyRes.json();
+          if (keyData?.hasKey && keyData?.key && isKeyFormatValid(keyData.key)) {
+            activeApiKey = sanitizeApiKey(keyData.key);
+            moduleActiveGeminiKey = activeApiKey;
+            verifiedKeyRef.current = activeApiKey;
+            try {
+              if (typeof window !== 'undefined') {
+                (window as any).__ZSTAR_ACTIVE_GEMINI_KEY__ = activeApiKey;
+              }
+            } catch (_) {}
+            handleUpdateApiKey(activeApiKey);
+          }
+        }
+      } catch (_) {}
+    }
+
+    if (!activeApiKey) {
+      setErrorMsg('Gemini API Key ထည့်သွင်းရန် လိုအပ်ပါသည် (Please enter your Gemini API Key in the box above to start AI video analysis)');
+      const inputEl = document.getElementById('gemini-api-key-input');
+      if (inputEl) {
+        inputEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        inputEl.focus();
+      }
+      return;
+    }
+
+    // 2. Clear old timeout state and abort any pending stream to trigger fresh request
     if (analyzeAbortControllerRef.current) {
       try {
         analyzeAbortControllerRef.current.abort();
@@ -1620,7 +2158,6 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
       clearInterval(analyzeProgressIntervalRef.current);
       analyzeProgressIntervalRef.current = null;
     }
-    setErrorMsg(null);
 
     setIsAnalyzingVideo(true);
     setAnalysisProgress(12);
@@ -1635,9 +2172,26 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     }, 600000);
 
     try {
-      // 1. Quick non-blocking poster frame sample for UI preview
-      if (videoRef.current && sampledFrames.length === 0) {
-        sampleFramesFromVideo().catch(() => {});
+      // 1. Extract maximum 5 visual keyframes evenly spaced across the video duration
+      let framesToSend: string[] = [];
+      if (sampledFrames && sampledFrames.length > 0) {
+        framesToSend = sampledFrames
+          .map((f) => f.dataUrl)
+          .filter((url) => url && url.startsWith('data:image/jpeg;base64,') && url.length > 400)
+          .slice(0, 5);
+      } else if (videoRef.current) {
+        try {
+          const extracted = await sampleFramesFromVideo(5);
+          if (extracted && extracted.length > 0) {
+            framesToSend = extracted
+              .map((f) => f.dataUrl)
+              .filter((url) => url && url.startsWith('data:image/jpeg;base64,') && url.length > 400)
+              .slice(0, 5);
+          }
+        } catch (frameErr: any) {
+          // Gracefully fallback to analyzing video title / metadata without throwing error
+          console.warn('Frame sampling caught warning in handleAnalyzeVideo, falling back gracefully to title/metadata:', frameErr);
+        }
       }
 
       // 2. Extract lightweight audio only if video is not already stored on server
@@ -1666,7 +2220,7 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
         const rounded = Math.min(96, Math.round(currentPct));
         setAnalysisProgress(rounded);
         if (rounded < 35) {
-          setAnalysisStatusText(`၂။ Video Audio လှိုင်းများကို Gemini 2.5 Flash သို့ ပေးပို့နေပါသည်... (${rounded}%)`);
+          setAnalysisStatusText(`၂။ Video Audio နှင့် Keyframes များကို Gemini 2.5 Flash သို့ ပေးပို့နေပါသည်... (${rounded}%)`);
         } else if (rounded < 65) {
           setAnalysisStatusText(`၃။ မြန်မာ ${recapMode === 'commentary' ? 'Commentary ဇာတ်လမ်းပြော' : 'Dubbing စကားပြော'} ဇာတ်ညွှန်းကို ဖန်တီးနေပါသည်... (${rounded}%)`);
         } else if (rounded < 85) {
@@ -1677,25 +2231,42 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
       }, 700);
       analyzeProgressIntervalRef.current = progressInterval;
 
-      const response = await fetch('/api/video/analyze-script', {
-        method: 'POST',
-        signal: abortController.signal,
-        credentials: 'same-origin',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(geminiApiKey ? { 'x-gemini-api-key': geminiApiKey.trim() } : {}),
+      const activeFrames = framesToSend.length > 0 ? framesToSend : (sampledFrames.length > 0 ? sampledFrames.slice(0, 8).map((f) => f.dataUrl) : undefined);
+      const apiKeyToSend = activeApiKey || getActiveGeminiApiKey();
+
+      const response = await fetchWith503Retry(
+        '/api/video/analyze-script',
+        {
+          method: 'POST',
+          signal: abortController.signal,
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(apiKeyToSend ? {
+              'x-gemini-api-key': apiKeyToSend,
+              'x-api-key': apiKeyToSend,
+            } : {}),
+          },
+          body: JSON.stringify({
+            frames: activeFrames,
+            audioBase64: (!serverVideoPath && audioBase64) ? (audioBase64.length > 2000000 ? audioBase64.slice(0, 2000000) : audioBase64) : undefined,
+            videoTitle: videoTitle || (inputMode === 'youtube' && youtubeLink ? `YouTube: ${youtubeLink}` : 'Uploaded Movie Video'),
+            videoUrl: (inputMode === 'youtube' && youtubeLink.trim()) ? youtubeLink.trim() : (videoUrl || undefined),
+            serverFilePath: serverVideoPath || undefined,
+            duration: duration || 240,
+            instructions: 'CRITICAL: Strictly analyze real visual frames of the uploaded video file. Describe SPECIFIC visual actions, character physical movements, backgrounds, facial expressions, and plot details occurring in the scene. STRICTLY PROHIBIT generic template intro phrases such as \'ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့...\', \'ဒီဗီဒီယိုထဲမှာတော့...\', \'ဒီဇာတ်လမ်းလေးကတော့...\', or any generic summaries. Format output in standard engaging Burmese Movie Recap narrator style.',
+            apiKey: apiKeyToSend || undefined,
+            recapMode,
+          }),
         },
-        body: JSON.stringify({
-          audioBase64: (!serverVideoPath && audioBase64) ? (audioBase64.length > 2000000 ? audioBase64.slice(0, 2000000) : audioBase64) : undefined,
-          videoTitle: videoTitle || (inputMode === 'youtube' && youtubeLink ? `YouTube: ${youtubeLink}` : 'Uploaded Movie Video'),
-          videoUrl: (inputMode === 'youtube' && youtubeLink.trim()) ? youtubeLink.trim() : (videoUrl || undefined),
-          serverFilePath: serverVideoPath || undefined,
-          duration: duration || 240,
-          instructions: customVideoPlot.trim() || undefined,
-          apiKey: geminiApiKey.trim() || undefined,
-          recapMode,
-        }),
-      });
+        (retryCount, delayMs) => {
+          setAnalysisStatusText(
+            `Gemini Server 503 (Unavailable) ဖြစ်ပေါ်နေသဖြင့် အလိုအလျောက် ပြန်လည်ချိတ်ဆက်နေပါသည် (ကြိုးစားမှု ${retryCount}/3၊ ${Math.round(delayMs / 1000)}s စောင့်ဆိုင်းနေပါသည်)...`
+          );
+        },
+        3,
+        1500
+      );
 
       if (analyzeProgressIntervalRef.current) {
         clearInterval(analyzeProgressIntervalRef.current);
@@ -1724,8 +2295,12 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
         throw new Error(`ဆာဗာ တုံ့ပြန်မှု ချို့ယွင်းနေပါသည် (${response.status}: ${title})။ ကျေးဇူးပြု၍ ပြန်လည်စမ်းသပ်ပေးပါ။`);
       }
 
-      if (!data || !data.success || !data.segments) {
-        throw new Error(data?.error || 'ဗီဒီယို ခွဲခြမ်းစိတ်ဖြာမှု မအောင်မြင်ပါ');
+      if (!response.ok || !data || !data.success || !data.segments) {
+        const rawErr = data?.error || data?.message;
+        const errText = typeof rawErr === 'object' && rawErr !== null
+          ? String(rawErr.message || rawErr.error || JSON.stringify(rawErr))
+          : String(rawErr || response.statusText || 'ဗီဒီယို ခွဲခြမ်းစိတ်ဖြာမှု မအောင်မြင်ပါ');
+        throw new Error(errText);
       }
 
       // Smooth animated finish to 100%
@@ -1853,17 +2428,14 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
         }, 60);
       }, 450);
     } catch (err: any) {
-      console.error('Analyze error:', err);
-      if (err.name === 'AbortError') {
-        setErrorMsg('Script ထုတ်လုပ်မှု အချိန်ပြည့်သွားပါသည် (600s Timeout)။ ကျေးဇူးပြု၍ "🎬 Analyze Video" ကို ပြန်လည်နှိပ်ပြီး ထပ်မံကြိုးစားနိုင်ပါသည်။');
-      } else {
-        const raw = err.message || '';
-        if (raw.includes('<!doctype') || raw.includes('Unexpected token')) {
-          setErrorMsg('ဆာဗာမှ တုံ့ပြန်မှု ချို့ယွင်းနေပါသည် (HTML error response)။ ကျေးဇူးပြု၍ "🎬 Analyze Video" ကို ပြန်လည်စမ်းသပ်ပေးပါ။');
-        } else {
-          setErrorMsg(raw || 'Video Analyze ပြုလုပ်ရာတွင် ချို့ယွင်းချက် ဖြစ်ပေါ်ခဲ့ပါသည်');
-        }
-      }
+      console.error(err);
+      const rawErrMsg = err?.message || err;
+      const errText = typeof rawErrMsg === 'object' && rawErrMsg !== null
+        ? String(rawErrMsg.message || JSON.stringify(rawErrMsg))
+        : String(rawErrMsg || '');
+      const errStr = String(errText).trim();
+      setErrorMsg(errStr || "API Error ဖြစ်ပွားပါသည်။");
+      // Fallback စာသားကြီးကို setGeneratedScript ထဲ လုံးဝ မထည့်ပါနဲ့
     } finally {
       if (analyzeProgressIntervalRef.current) {
         clearInterval(analyzeProgressIntervalRef.current);
@@ -2355,7 +2927,7 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     try {
       // First extract frames if video is loaded and not sampled yet
       if (videoRef.current && sampledFrames.length === 0) {
-        setGenerationStep('ဗီဒီယို Timeline အလိုက် Keyframes (၁၅-၂၀ ပုံ) ကို ရယူနေပါသည်...');
+        setGenerationStep('ဗီဒီယို Timeline အလိုက် Keyframes (၅-၈ ပုံ) ကို ရယူနေပါသည်...');
         await sampleFramesFromVideo();
       }
 
@@ -2371,23 +2943,33 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
 
       setGenerationStep('မြန်မာဘာသာဖြင့် ဇာတ်လမ်းအကျဉ်းနှင့် Voiceover Script ရေးသားနေပါသည်...');
 
-      const response = await fetch('/api/recap/generate', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(geminiApiKey ? { 'x-gemini-api-key': geminiApiKey.trim() } : {}),
+      const activeKey = getActiveGeminiApiKey();
+      const response = await fetchWith503Retry(
+        '/api/recap/generate',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(activeKey ? { 'x-gemini-api-key': activeKey } : {}),
+          },
+          body: JSON.stringify({
+            movieTitle: movieName,
+            language: translationLanguage === 'myanmar' ? 'burmese' : 'english',
+            style: recapStyle === 'cinematic' ? 'detailed' : recapStyle === 'fast' ? 'fast' : 'voiceover',
+            voiceoverTone,
+            durationMin: recapDuration,
+            primaryGenre: activeGenre,
+            apiKey: activeKey || undefined,
+          }),
         },
-        body: JSON.stringify({
-          movieTitle: movieName,
-          language: translationLanguage === 'myanmar' ? 'burmese' : 'english',
-          style: recapStyle === 'cinematic' ? 'detailed' : recapStyle === 'fast' ? 'fast' : 'voiceover',
-          voiceoverTone,
-          durationMin: recapDuration,
-          primaryGenre: activeGenre,
-          customPlot: customVideoPlot.trim() || undefined,
-          apiKey: geminiApiKey.trim() || undefined,
-        }),
-      });
+        (retryCount, delayMs) => {
+          setGenerationStep(
+            `Gemini Server 503 (Unavailable) ဖြစ်ပေါ်နေသဖြင့် အလိုအလျောက် ပြန်လည်ချိတ်ဆက်နေပါသည် (ကြိုးစားမှု ${retryCount}/3၊ ${Math.round(delayMs / 1000)}s စောင့်ဆိုင်းနေပါသည်)...`
+          );
+        },
+        3,
+        1500
+      );
 
       const resData = await response.json();
       if (!resData.success && !resData.recap) {
@@ -2484,7 +3066,16 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
       }, 300);
     } catch (err: any) {
       console.error(err);
-      setErrorMsg(err.message || 'Recap ဖန်တီးရာတွင် အမှားတစ်ခု ဖြစ်ပေါ်ခဲ့သည်');
+      const rawErrMsg = err?.message || err;
+      const errText = typeof rawErrMsg === 'object' && rawErrMsg !== null
+        ? String(rawErrMsg.message || JSON.stringify(rawErrMsg))
+        : String(rawErrMsg || '');
+      const errStr = String(errText);
+      if (errStr.includes('429')) {
+        setErrorMsg("API Quota ပြည့်သွားပါပြီ။ ၁ မိနစ်ခန့် စောင့်ပြီးမှ ပြန်စမ်းပါ။");
+      } else {
+        setErrorMsg(errStr || "API Error ဖြစ်ပွားပါသည်။");
+      }
     } finally {
       setIsGenerating(false);
       setGenerationStep('');
@@ -2759,7 +3350,6 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
           voiceoverTone,
           durationMin: recapDuration,
           primaryGenre: targetGenre,
-          customPlot: customVideoPlot.trim() || undefined,
         }),
       });
       const resData = await response.json();
@@ -2857,19 +3447,30 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
 
       setTranscribeStep('Gemini AI ဖြင့် စကားပြောများကို အသံမှ စာသားပြောင်းပြီး မြန်မာပြန်ဆိုနေပါသည်...');
 
-      const res = await fetch('/api/video/transcribe', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(geminiApiKey ? { 'x-gemini-api-key': geminiApiKey.trim() } : {}),
+      const activeKey = getActiveGeminiApiKey();
+      const res = await fetchWith503Retry(
+        '/api/video/transcribe',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(activeKey ? { 'x-gemini-api-key': activeKey } : {}),
+          },
+          body: JSON.stringify({
+            audioBase64: audioBase64 || 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=',
+            mimeType: 'audio/wav',
+            movieTitle: videoTitle || 'Uploaded Movie',
+            apiKey: activeKey || undefined,
+          }),
         },
-        body: JSON.stringify({
-          audioBase64: audioBase64 || 'UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQAAAAA=',
-          mimeType: 'audio/wav',
-          movieTitle: videoTitle || 'Uploaded Movie',
-          apiKey: geminiApiKey.trim() || undefined,
-        }),
-      });
+        (retryCount, delayMs) => {
+          setTranscribeStep(
+            `Gemini Server 503 (Unavailable) ဖြစ်ပေါ်နေသဖြင့် အလိုအလျောက် ပြန်လည်ချိတ်ဆက်နေပါသည် (ကြိုးစားမှု ${retryCount}/3၊ ${Math.round(delayMs / 1000)}s စောင့်ဆိုင်းနေပါသည်)...`
+          );
+        },
+        3,
+        1500
+      );
 
       const data = await res.json();
       if (!data.success || !data.segments) {
@@ -3571,7 +4172,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     setVideoTitle('');
     setServerVideoPath(null);
     setYoutubeLink('');
-    setCustomVideoPlot('');
 
     // 4. Clear recap, subtitles & dialogue scripts
     setGeneratedRecap(null);
@@ -3888,41 +4488,161 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             </p>
           </div>
 
-          {/* Gemini API Key input box (Optional custom key / 403 error prevention) */}
-          <div className="bg-[#080d18] border border-cyan-500/30 rounded-2xl p-4 sm:p-5 space-y-2.5">
-            <div className="flex items-center justify-between">
-              <label className="text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5">
-                <Key className="w-3.5 h-3.5 text-cyan-400" />
-                <span>GEMINI API KEY (OPTIONAL / 403 ERROR ရှင်းရန်)</span>
+          {/* Gemini API Key UI Input Box with Direct Persistence & Error Clearing */}
+          <div className="bg-[#080d18] border-2 border-cyan-500/40 hover:border-cyan-400/70 rounded-2xl p-4 sm:p-5 space-y-3 transition-all duration-200 shadow-xl shadow-cyan-950/40">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <label htmlFor="gemini-api-key-input" className="text-xs font-mono font-bold text-cyan-300 flex items-center gap-1.5 cursor-pointer">
+                <Key className="w-4 h-4 text-cyan-400" />
+                <span>GEMINI API KEY</span>
+                <span className="text-[10px] text-slate-400 font-sans font-normal">(Direct Multimodal Script Engine)</span>
               </label>
-              <span className="text-[11px] text-cyan-400 font-mono">
-                {geminiApiKey ? '✓ Custom Key Active' : 'Default Studio Key'}
-              </span>
+
+              <div className="flex items-center gap-2">
+                {geminiApiKey ? (
+                  <span className="text-[11px] font-mono font-bold text-emerald-400 bg-emerald-950/80 px-2 py-0.5 rounded-lg border border-emerald-800 flex items-center gap-1">
+                    <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                    <span>✓ Key Active</span>
+                  </span>
+                ) : (
+                  <span className="text-[11px] font-mono font-bold text-amber-300 bg-amber-950/80 px-2 py-0.5 rounded-lg border border-amber-800 flex items-center gap-1">
+                    <AlertCircle className="w-3 h-3 text-amber-400" />
+                    <span>Key ထည့်ရန် လိုအပ်ပါသည်</span>
+                  </span>
+                )}
+                <a
+                  href="https://aistudio.google.com/app/apikey"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-[11px] font-mono font-bold text-cyan-300 hover:text-cyan-200 bg-cyan-950/80 hover:bg-cyan-900/80 px-2.5 py-0.5 rounded-lg border border-cyan-700 flex items-center gap-1 transition-all"
+                  title="Google AI Studio မှ အခမဲ့ API Key ရယူရန်"
+                >
+                  <span>Get Free Key</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+              </div>
             </div>
+
             <div className="flex items-center gap-2">
               <div className="relative flex-1">
                 <input
+                  id="gemini-api-key-input"
                   type={showKeyText ? 'text' : 'password'}
                   value={geminiApiKey}
                   onChange={(e) => handleUpdateApiKey(e.target.value)}
-                  placeholder="AIzaSy... သင်၏ ကိုယ်ပိုင် Gemini API Key ကို ထည့်သွင်းနိုင်ပါသည်"
-                  className="w-full bg-[#0b1322] text-white text-xs px-3.5 py-2.5 rounded-xl border border-slate-700/80 focus:outline-none focus:border-cyan-400 font-mono placeholder:text-slate-500"
+                  placeholder="Gemini API Key ကို ဤနေရာတွင် ထည့်သွင်းပါ (ဥပမာ: AIzaSy...)"
+                  className="w-full bg-[#0b1322] text-white text-xs px-3.5 py-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-cyan-400 font-mono placeholder:text-slate-500 transition-colors"
                 />
-                <button
-                  type="button"
-                  onClick={() => setShowKeyText(!showKeyText)}
-                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white text-xs font-mono px-2 py-0.5 rounded cursor-pointer"
-                >
-                  {showKeyText ? 'Hide' : 'Show'}
-                </button>
+                <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      try {
+                        const text = await navigator.clipboard.readText();
+                        if (text && text.trim()) {
+                          handleUpdateApiKey(text.trim());
+                        }
+                      } catch (_) {}
+                    }}
+                    className="text-[10px] text-cyan-400 hover:text-cyan-200 font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 transition-colors cursor-pointer"
+                    title="Paste from clipboard"
+                  >
+                    Paste
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setShowKeyText(!showKeyText)}
+                    className="text-[10px] text-slate-400 hover:text-white font-mono px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 transition-colors cursor-pointer"
+                  >
+                    {showKeyText ? 'Hide' : 'Show'}
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isVerifyingKey || !(geminiApiKey || getActiveGeminiApiKey())}
+                    onClick={() => handleVerifyApiKey()}
+                    className="text-[10px] text-cyan-300 hover:text-white font-mono px-2 py-1 rounded bg-cyan-950 hover:bg-cyan-900 border border-cyan-800/80 transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-40"
+                    title="Gemini API Key ချိတ်ဆက်မှု စမ်းသပ်မည် (Test API Key connection live)"
+                  >
+                    {isVerifyingKey ? (
+                      <>
+                        <Loader2 className="w-2.5 h-2.5 animate-spin text-cyan-400" />
+                        <span>Checking...</span>
+                      </>
+                    ) : (
+                      <span>Test Key</span>
+                    )}
+                  </button>
+                </div>
               </div>
+
               {geminiApiKey && (
                 <button
                   type="button"
-                  onClick={() => handleUpdateApiKey('')}
-                  className="px-3 py-2.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded-xl text-xs font-bold transition-all cursor-pointer"
+                  onClick={() => {
+                    handleUpdateApiKey('');
+                    setKeyVerificationStatus(null);
+                  }}
+                  className="px-3 py-2.5 bg-rose-500/20 hover:bg-rose-500/30 text-rose-300 border border-rose-500/40 rounded-xl text-xs font-bold transition-all cursor-pointer shrink-0"
+                  title="API Key ဖျက်မည်"
                 >
-                  Reset
+                  Clear
+                </button>
+              )}
+            </div>
+
+            {/* Live API Key Verification Status */}
+            {keyVerificationStatus && (
+              <div className={`p-2.5 rounded-xl border text-xs font-mono flex items-center justify-between gap-2 animate-fadeIn ${
+                keyVerificationStatus.verified
+                  ? 'bg-emerald-950/50 border-emerald-500/50 text-emerald-300'
+                  : 'bg-rose-950/50 border-rose-500/50 text-rose-300'
+              }`}>
+                <div className="flex items-center gap-2 flex-1 min-w-0">
+                  {keyVerificationStatus.verified ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                  )}
+                  <span className="truncate">{keyVerificationStatus.message}</span>
+                  {keyVerificationStatus.model && (
+                    <span className="text-[10px] bg-emerald-900/60 px-1.5 py-0.5 rounded border border-emerald-700 shrink-0">
+                      Model: {keyVerificationStatus.model}
+                    </span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setKeyVerificationStatus(null)}
+                  className="text-slate-400 hover:text-white text-xs cursor-pointer p-0.5 shrink-0"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {/* Real-time Feedback & Instructions */}
+            <div className="flex items-center justify-between text-[11px] text-slate-400 flex-wrap gap-2 pt-0.5">
+              {keyInputFeedback ? (
+                <span className="text-emerald-400 flex items-center gap-1 animate-fadeIn font-semibold">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span>{keyInputFeedback}</span>
+                </span>
+              ) : !geminiApiKey ? (
+                <span className="text-amber-300/90 flex items-center gap-1">
+                  <span>💡 ဗီဒီယိုကို လေ့လာသုံးသပ်ပြီး မြန်မာဇာတ်ညွှန်းထုတ်ရန် Gemini API Key ထည့်သွင်းပေးပါခင်ဗျာ။</span>
+                </span>
+              ) : (
+                <span className="text-emerald-400 flex items-center gap-1">
+                  <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                  <span>Gemini API Key ချိတ်ဆက်ပြီးပါပြီ။ Video-to-Script စတင်ခွဲခြမ်းစိတ်ဖြာနိုင်ပါပြီ။</span>
+                </span>
+              )}
+              {errorMsg && (
+                <button
+                  type="button"
+                  onClick={() => setErrorMsg(null)}
+                  className="text-rose-400 hover:text-rose-300 underline font-mono text-[10px] cursor-pointer ml-auto"
+                >
+                  Clear Active Error
                 </button>
               )}
             </div>
@@ -4212,7 +4932,10 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             <div className="pt-2">
               <button
                 type="button"
-                onClick={handleAnalyzeVideo}
+                onClick={() => {
+                  setErrorMsg(null);
+                  handleAnalyzeVideo();
+                }}
                 disabled={isAnalyzingVideo || isGenerating}
                 className="w-full py-4 px-6 rounded-2xl font-black text-sm sm:text-base tracking-wide text-slate-950 bg-gradient-to-r from-cyan-400 via-sky-300 to-blue-500 hover:from-cyan-300 hover:via-sky-200 hover:to-blue-400 shadow-xl shadow-cyan-500/30 transition-all duration-200 transform hover:scale-[1.01] active:scale-[0.99] disabled:opacity-60 disabled:cursor-not-allowed flex items-center justify-center gap-3 cursor-pointer ring-2 ring-cyan-300/60"
               >
@@ -4275,26 +4998,62 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 
               {/* Analysis Error Alert */}
               {errorMsg && (
-                <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 space-y-2.5 shadow-lg animate-fadeIn">
-                  <div className="flex items-start gap-2.5">
-                    <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
-                    <div className="flex-1 space-y-1">
-                      <p className="font-bold text-rose-300">Gemini Video Analysis မှတ်ချက်:</p>
-                      <p className="leading-relaxed text-rose-200/90">{errorMsg}</p>
+                <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 space-y-2.5 shadow-lg animate-fadeIn relative">
+                  <div className="flex items-start justify-between gap-2.5">
+                    <div className="flex items-start gap-2.5 flex-1 min-w-0">
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+                      <div className="flex-1 min-w-0 space-y-1">
+                        <p className="font-bold text-rose-300">Gemini Video Analysis မှတ်ချက်:</p>
+                        <p className="leading-relaxed text-rose-200/90 break-words">{errorMsg}</p>
+                      </div>
                     </div>
-                  </div>
-                  <div className="flex items-center justify-end gap-2 pt-1 border-t border-rose-900/50">
                     <button
                       type="button"
-                      onClick={() => {
-                        setErrorMsg(null);
-                        handleAnalyzeVideo();
-                      }}
-                      className="px-3.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 text-xs font-bold border border-rose-500/40 cursor-pointer flex items-center gap-1.5 transition-all"
+                      onClick={() => setErrorMsg(null)}
+                      className="p-1 rounded-lg text-rose-300/70 hover:text-rose-100 hover:bg-rose-800/40 transition-colors cursor-pointer shrink-0"
+                      title="ပိတ်မည် (Dismiss)"
                     >
-                      <RefreshCw className="w-3 h-3" />
-                      <span>ပြန်လည်စမ်းသပ်မည် (Retry)</span>
+                      <X className="w-4 h-4" />
                     </button>
+                  </div>
+                  <div className="flex items-center justify-between flex-wrap gap-2 pt-1 border-t border-rose-900/50">
+                    {!(getActiveGeminiApiKey() || keyVerificationStatus?.verified) && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setErrorMsg(null);
+                          const inputEl = document.getElementById('gemini-api-key-input');
+                          if (inputEl) {
+                            inputEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            inputEl.focus();
+                          }
+                        }}
+                        className="px-3.5 py-1.5 rounded-lg bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-black cursor-pointer flex items-center gap-1.5 transition-all shadow-md shadow-cyan-500/20 ring-1 ring-cyan-300"
+                      >
+                        <Key className="w-3.5 h-3.5" />
+                        <span>Gemini API Key အသစ် ထည့်သွင်းမည် (Enter New Key)</span>
+                      </button>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setErrorMsg(null)}
+                        className="px-3 py-1.5 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-xs font-bold border border-slate-700 cursor-pointer transition-all"
+                      >
+                        Error ဖျက်မည် (Clear Error)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setErrorMsg(null);
+                          handleAnalyzeVideo();
+                        }}
+                        className="px-3.5 py-1.5 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 text-xs font-bold border border-rose-500/40 cursor-pointer flex items-center gap-1.5 transition-all"
+                      >
+                        <RefreshCw className="w-3 h-3" />
+                        <span>ပြန်လည်စမ်းသပ်မည် (Retry)</span>
+                      </button>
+                    </div>
                   </div>
                 </div>
               )}
@@ -5340,93 +6099,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             </div>
           )}
 
-          {/* Header (Compact & Space-efficient) */}
-          <div className="flex flex-col gap-0.5 sm:gap-1 px-1 py-1 pb-2 border-b border-slate-800/70">
-            <div className="flex items-center justify-between">
-              <div className="flex items-center gap-1.5 font-mono text-[10px] sm:text-xs font-bold uppercase tracking-wider text-slate-400">
-                <span className="text-cyan-400 font-extrabold px-1.5 py-0.5 rounded bg-cyan-950/70 border border-cyan-800/60 text-[9px] sm:text-[10px]">03</span>
-                <span>STEP 3 • Z-STUDIO VIDEO EDITOR & EXPORT</span>
-              </div>
-              <div className="flex items-center gap-1 text-[10px] sm:text-xs font-semibold text-cyan-400">
-                <Palette className="w-3 h-3 text-cyan-400" />
-                <span className="font-mono hidden sm:inline">COLOR GRADING & SUBTITLE BURN-IN</span>
-              </div>
-            </div>
-            <h2 className="text-sm sm:text-base font-bold text-white tracking-tight leading-snug">
-              Real-time Video Preview & Color Grading
-            </h2>
-            <p className="text-[11px] sm:text-xs text-slate-400 leading-tight">
-              Preview your video with synchronized TikTok Yellow subtitles, apply film color grading, and render final MP4.
-            </p>
-          </div>
-
-          {/* SECTION 1: STICKY/FIXED Real-time Video Preview Player Canvas (Requirement 2) */}
-          <div
-            className="w-full sticky top-0 z-[100] bg-[#0f172a] p-2 sm:p-3 rounded-2xl sm:rounded-3xl border border-slate-800/90 shadow-2xl flex flex-col gap-2 backdrop-blur-xl"
-            style={{ position: 'sticky', top: 0, zIndex: 100, background: '#0f172a' }}
-          >
-            <div className="flex items-center justify-between text-xs text-slate-400 px-1">
-              <span className="font-bold flex items-center gap-2 text-white truncate max-w-[180px] sm:max-w-xs">
-                <Film className="w-4 h-4 text-cyan-400 shrink-0" />
-                <span className="truncate">{videoTitle || 'Live Preview'}</span>
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold hidden sm:inline-flex items-center gap-1">
-                  <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse"></span>
-                  <span>Live Preview</span>
-                </span>
-              </span>
-              <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-                <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-emerald-950/90 text-emerald-300 border border-emerald-800 flex items-center gap-1 shadow-sm">
-                  <Sparkles className="w-3 h-3 text-cyan-400 shrink-0" />
-                  <span>{syncDriftStatus.statusText}</span>
-                </span>
-                {videoZoomScale !== 100 && (
-                  <span className="text-[10px] font-mono px-2 py-0.5 rounded-md bg-cyan-950/90 text-cyan-300 border border-cyan-800/80">
-                    🔍 {videoZoomScale}%
-                  </span>
-                )}
-                {/* Video Color Filter dropdown */}
-                <div className="flex items-center gap-1 bg-slate-900 border border-slate-700/80 rounded-lg px-2 py-0.5 shadow-sm">
-                  <Palette className="w-3 h-3 text-cyan-400 shrink-0" />
-                  <select
-                    value={colorGradingPreset}
-                    onChange={(e) => handleApplyColorPreset(e.target.value as any)}
-                    className="bg-transparent text-cyan-300 text-[10px] sm:text-[11px] font-bold focus:outline-none cursor-pointer pr-1"
-                    title="Video Color Filter"
-                  >
-                    <option value="normal" className="bg-[#0b1322] text-white">Normal (မူရင်း)</option>
-                    <option value="moody" className="bg-[#0b1322] text-white">Moody (အမှောင်)</option>
-                    <option value="vintage" className="bg-[#0b1322] text-white">Vintage (ရှေးဟောင်း)</option>
-                    <option value="vibrant" className="bg-[#0b1322] text-white">Vibrant (တောက်ပ)</option>
-                    <option value="noir" className="bg-[#0b1322] text-white">Film Noir (အဖြူအမည်း)</option>
-                    <option value="cyberpunk" className="bg-[#0b1322] text-white">Cyberpunk (နီယွန်)</option>
-                  </select>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setMirrorVideo(!mirrorVideo)}
-                  className={`px-2 py-0.5 rounded-lg text-[11px] font-bold transition-all cursor-pointer flex items-center gap-1 border ${
-                    mirrorVideo
-                      ? 'bg-amber-400 text-slate-950 border-amber-300 shadow-[0_0_12px_rgba(251,191,36,0.6)] font-black'
-                      : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
-                  }`}
-                  title="Mirror video horizontally to avoid copyright strikes"
-                >
-                  <span>🪞 Mirror</span>
-                  {mirrorVideo && <span className="bg-black text-amber-300 text-[9px] px-1 rounded font-mono">ON</span>}
-                </button>
-              </div>
-            </div>
-
-            {/* Video Canvas Container (Responsive sticky height: stationary on mobile scroll, object-fit: contain) */}
+          {/* ========================================================================= */}
+          {/* STEP 3: CAPCUT-STYLE 16:9 VIDEO EDITOR & MINIMALIST BOTTOM TOOLBAR        */}
+          {/* ========================================================================= */}
+          <div className="w-full max-w-4xl mx-auto flex flex-col bg-[#0b1322] border border-slate-800 rounded-none sm:rounded-2xl overflow-hidden shadow-2xl">
+            {/* 1. CLEAN 16:9 VIDEO PLAYER CONTAINER (Edge-to-edge, NO tools or headers above) */}
             <div
-              className={`relative mx-auto ${getContainerAspectClass()} rounded-xl sm:rounded-2xl overflow-hidden bg-black border border-slate-700 shadow-2xl transition-all duration-300 flex items-center justify-center min-h-[220px] sm:min-h-[360px] h-[36vh] sm:h-[48vh] max-h-[50vh] w-full`}
+              className="relative w-full aspect-video bg-black overflow-hidden flex items-center justify-center select-none"
               style={{ contain: 'paint', willChange: 'transform' }}
             >
               {videoUrl ? (
                 <video
                   ref={videoRef}
                   src={videoUrl}
-                  controls
                   preload="metadata"
                   playsInline
                   muted={originalAudioVolume === 0}
@@ -5438,8 +6123,6 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                   style={{
                     width: '100%',
                     height: '100%',
-                    maxWidth: '100%',
-                    maxHeight: '100%',
                     position: 'absolute',
                     top: '50%',
                     left: '50%',
@@ -5455,23 +6138,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 />
               ) : (
                 <div className="absolute inset-0 flex flex-col items-center justify-center p-6 text-center bg-gradient-to-b from-[#080d18] via-[#0b1322] to-[#040812] select-none z-10">
-                  <div className="w-14 h-14 rounded-2xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 mb-3 shadow-lg shadow-cyan-500/10">
-                    <Film className="w-7 h-7" />
+                  <div className="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center text-cyan-400 mb-2 shadow-lg shadow-cyan-500/10">
+                    <Film className="w-6 h-6" />
                   </div>
                   <h3 className="text-sm sm:text-base font-bold text-white mb-1">
-                    Upload a video to start
+                    ဗီဒီယို မရွေးချယ်ရသေးပါ
                   </h3>
-                  <p className="text-xs text-slate-400 max-w-xs mb-3.5 leading-relaxed">
-                    ဗီဒီယိုဖိုင် မရွေးချယ်ရသေးပါ။ Step 1 တွင် ရုပ်ရှင်ဖိုင် ရွေးချယ်ပြီးပါက ဤနေရာတွင် တိုက်ရိုက် ကြည့်ရှုတည်းဖြတ်နိုင်ပါမည်။
+                  <p className="text-xs text-slate-400 max-w-xs mb-3 leading-relaxed">
+                    Step 1 တွင် ရုပ်ရှင်ဖိုင် ရွေးချယ်ပြီးပါက ဤနေရာတွင် တိုက်ရိုက် ကြည့်ရှုတည်းဖြတ်နိုင်ပါမည်။
                   </p>
                   <button
                     type="button"
                     onClick={() => setActiveStep(1)}
-                    className="px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs shadow-md shadow-cyan-500/20 cursor-pointer flex items-center gap-2 transition-transform hover:scale-105 active:scale-95"
+                    className="px-3.5 py-1.5 rounded-xl bg-gradient-to-r from-cyan-400 to-blue-500 hover:from-cyan-300 hover:to-blue-400 text-slate-950 font-bold text-xs shadow-md shadow-cyan-500/20 cursor-pointer flex items-center gap-1.5 transition-transform hover:scale-105 active:scale-95"
                   >
                     <Upload className="w-3.5 h-3.5" />
                     <span>Choose Video in Step 1</span>
                   </button>
+                </div>
+              )}
+
+              {/* Freeze Frame Overlay when freeze is active */}
+              {isFreezeActive && freezeSnapshotUrl && (
+                <div className="absolute inset-0 z-20 pointer-events-none flex items-center justify-center bg-black/60 backdrop-blur-[1px]">
+                  <img
+                    src={freezeSnapshotUrl}
+                    alt="Frozen Frame"
+                    className="w-full h-full object-contain"
+                    style={{
+                      transform: `${mirrorVideo ? 'scaleX(-1) ' : ''}scale(${videoZoomScale / 100})`,
+                      filter: getColorFilterString(),
+                    }}
+                  />
+                  <div className="absolute top-3 left-3 bg-cyan-950/90 border border-cyan-400 text-cyan-300 px-2.5 py-1 rounded-lg text-[10px] font-mono font-bold flex items-center gap-1.5 shadow-lg animate-pulse">
+                    <span>❄️ FROZEN FRAME (${freezeDurationSec}s)</span>
+                  </div>
                 </div>
               )}
 
@@ -5480,19 +6181,19 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 <div
                   className={`absolute ${
                     watermarkCorner === 'top-left'
-                      ? 'top-3 left-3'
+                      ? 'top-2 left-2'
                       : watermarkCorner === 'top-right'
-                      ? 'top-3 right-3'
+                      ? 'top-2 right-2'
                       : watermarkCorner === 'bottom-left'
-                      ? 'bottom-14 left-3'
-                      : 'bottom-14 right-3'
-                  } w-28 h-10 backdrop-blur-2xl bg-black/50 border border-cyan-400/40 rounded-lg flex items-center justify-center text-[10px] text-cyan-300 font-mono shadow-md pointer-events-none z-10`}
+                      ? 'bottom-2 left-2'
+                      : 'bottom-2 right-2'
+                  } w-24 h-8 backdrop-blur-2xl bg-black/50 border border-cyan-400/40 rounded-lg flex items-center justify-center text-[9px] text-cyan-300 font-mono shadow-md pointer-events-none z-10`}
                 >
                   [ Watermark Blur ]
                 </div>
               )}
 
-              {/* Original Subtitle Blur Mask (Clean Gaussian Blur Box) */}
+              {/* Original Subtitle Blur Mask */}
               {blurMaskEnabled && (
                 <div
                   style={{
@@ -5500,12 +6201,12 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                     left: '50%',
                     transform: 'translateX(-50%)',
                     top: `${blurMaskY}%`,
-                    width: `${aspectRatio === '9:16' ? Math.min(blurMaskWidth, 90) : blurMaskWidth}%`,
+                    width: `${blurMaskWidth}%`,
                     height: `${blurMaskHeight}%`,
                     backdropFilter: `blur(${blurMaskIntensity}px)`,
                     WebkitBackdropFilter: `blur(${blurMaskIntensity}px)`,
                     backgroundColor: `rgba(15, 23, 42, ${(blurMaskOpacity / 100) * 0.75})`,
-                    borderRadius: '8px',
+                    borderRadius: '6px',
                     pointerEvents: 'none',
                     zIndex: 8,
                   }}
@@ -5513,14 +6214,17 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 />
               )}
 
-              {/* Synchronized Myanmar Subtitles Overlay (Bottom-Center, max 2 lines, responsive clamp font size) */}
+              {/* Synchronized Myanmar Subtitles Overlay with flexible positioning */}
               {((isCustomSubtitleMode && customSubtitleText.trim()) || activeSubtitle) && (
                 <div
                   style={{
                     position: 'absolute',
-                    bottom: '12px',
-                    left: '50%',
-                    transform: 'translateX(-50%)',
+                    left: `calc(50% + ${subtitleOffsetX}px)`,
+                    ...(subtitlePositionPreset === 'top'
+                      ? { top: `calc(12% + ${subtitleOffsetY}px)` }
+                      : subtitlePositionPreset === 'center'
+                      ? { top: `calc(50% + ${subtitleOffsetY}px)`, transform: 'translate(-50%, -50%)' }
+                      : { bottom: `calc(12px - ${subtitleOffsetY}px)`, transform: 'translateX(-50%)' }),
                     width: '90%',
                     zIndex: 10,
                     pointerEvents: 'none',
@@ -5567,1216 +6271,740 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 </div>
               )}
             </div>
-          </div>
 
-          {/* SECTION 2: SIDE-SWIPE HORIZONTAL TOOLBAR FOR VIDEO EDITOR (Requirement 3) */}
-          <div
-            className="w-full bg-[#0b1322] border border-cyan-500/30 rounded-2xl shadow-xl scrollbar-none items-center select-none"
-            style={{
-              display: 'flex',
-              flexDirection: 'row',
-              flexWrap: 'nowrap',
-              overflowX: 'auto',
-              WebkitOverflowScrolling: 'touch',
-              gap: '12px',
-              padding: '10px 5px',
-            }}
-          >
-            {/* Tool 1: [Font Size] */}
-            <div className="flex items-center gap-2 bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 py-1.5 shrink-0 shadow-sm">
-              <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1 shrink-0">
-                <Type className="w-3.5 h-3.5 text-cyan-400" />
-                <span className="hidden sm:inline">Size:</span>
-                <span className="font-mono text-cyan-300 font-bold">{subtitleFontSize}px</span>
+            {/* Video Controls & Timeline Scrubber Bar */}
+            <div className="bg-[#0b1322] px-3 py-2 border-t border-slate-800 flex items-center gap-2.5 text-xs text-slate-300">
+              <button
+                type="button"
+                onClick={() => {
+                  if (!videoRef.current) return;
+                  if (videoRef.current.paused) {
+                    videoRef.current.play();
+                    setIsPlaying(true);
+                  } else {
+                    videoRef.current.pause();
+                    setIsPlaying(false);
+                  }
+                }}
+                className="w-8 h-8 rounded-full bg-cyan-500 hover:bg-cyan-400 text-slate-950 flex items-center justify-center shrink-0 cursor-pointer shadow-md transition-transform hover:scale-105 active:scale-95"
+                title={isPlaying ? 'Pause' : 'Play'}
+              >
+                {isPlaying ? <Pause className="w-4 h-4 fill-current" /> : <Play className="w-4 h-4 fill-current ml-0.5" />}
+              </button>
+
+              <span className="font-mono text-[11px] text-slate-300 shrink-0 w-24 text-center">
+                {formatSecondsToTime(currentTime)} / {formatSecondsToTime(duration || 0)}
               </span>
+
               <input
                 type="range"
-                min="12"
-                max="32"
-                step="1"
-                value={subtitleFontSize}
-                onChange={(e) => setSubtitleFontSize(parseInt(e.target.value))}
-                className="w-16 sm:w-24 h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-cyan-400 shrink-0"
+                min="0"
+                max={duration || 100}
+                step="0.1"
+                value={currentTime}
+                onChange={(e) => {
+                  const targetSec = parseFloat(e.target.value);
+                  setCurrentTime(targetSec);
+                  if (videoRef.current) {
+                    videoRef.current.currentTime = targetSec;
+                  }
+                }}
+                className="flex-1 h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
               />
-              <div className="flex items-center gap-1 shrink-0">
-                {[
-                  { label: '14', size: 14 },
-                  { label: '18', size: 18 },
-                  { label: '24', size: 24 },
-                ].map((preset) => (
-                  <button
-                    key={preset.size}
-                    type="button"
-                    onClick={() => setSubtitleFontSize(preset.size)}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-bold transition-all cursor-pointer border ${
-                      subtitleFontSize === preset.size
-                        ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black shadow-sm'
-                        : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                    }`}
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-            </div>
 
-            {/* Tool 2: [Alignment] */}
-            <div className="flex items-center gap-1 bg-slate-900/90 border border-slate-800 rounded-xl p-1 shrink-0 shadow-sm">
-              <button
-                type="button"
-                onClick={() => setSubtitleTextAlign('left')}
-                className={`px-2 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold ${
-                  subtitleTextAlign === 'left' ? 'bg-cyan-500 text-slate-950 font-black shadow-sm' : 'text-slate-400 hover:text-white'
-                }`}
-                title="Align Left"
-              >
-                <AlignLeft className="w-3.5 h-3.5" />
-                <span>Left</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubtitleTextAlign('center')}
-                className={`px-2 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold ${
-                  subtitleTextAlign === 'center' ? 'bg-cyan-500 text-slate-950 font-black shadow-sm' : 'text-slate-400 hover:text-white'
-                }`}
-                title="Align Center"
-              >
-                <AlignCenter className="w-3.5 h-3.5" />
-                <span>Center</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubtitleTextAlign('right')}
-                className={`px-2 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold ${
-                  subtitleTextAlign === 'right' ? 'bg-cyan-500 text-slate-950 font-black shadow-sm' : 'text-slate-400 hover:text-white'
-                }`}
-                title="Align Right"
-              >
-                <AlignRight className="w-3.5 h-3.5" />
-                <span>Right</span>
-              </button>
-            </div>
-
-            {/* Tool 3: [Bold / Italic / Box] */}
-            <div className="flex items-center gap-1 bg-slate-900/90 border border-slate-800 rounded-xl p-1 shrink-0 shadow-sm">
-              <button
-                type="button"
-                onClick={() => setSubtitleBold(!subtitleBold)}
-                className={`px-2.5 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold border ${
-                  subtitleBold
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black shadow-sm'
-                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                }`}
-                title="Toggle Bold (B)"
-              >
-                <BoldIcon className="w-3.5 h-3.5" />
-                <span>B</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubtitleItalic(!subtitleItalic)}
-                className={`px-2.5 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold border ${
-                  subtitleItalic
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 italic font-black shadow-sm'
-                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                }`}
-                title="Toggle Italic (I)"
-              >
-                <ItalicIcon className="w-3.5 h-3.5" />
-                <span>I</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubtitleBgBox(!subtitleBgBox)}
-                className={`px-2.5 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold border ${
-                  subtitleBgBox
-                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black shadow-sm'
-                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                }`}
-                title="Toggle Background Box"
-              >
-                <Square className="w-3.5 h-3.5" />
-                <span>Box</span>
-              </button>
-            </div>
-
-            {/* Tool 4: [Shadow / Outline] */}
-            <div className="flex items-center gap-1 bg-slate-900/90 border border-slate-800 rounded-xl p-1 shrink-0 shadow-sm">
-              <button
-                type="button"
-                onClick={() => setSubtitleShadow(!subtitleShadow)}
-                className={`px-2.5 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold border ${
-                  subtitleShadow
-                    ? 'bg-amber-400 text-slate-950 border-amber-300 font-black shadow-sm'
-                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                }`}
-                title="Toggle Shadow"
-              >
-                <span>🌑 Shadow</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setSubtitleOutline(!subtitleOutline)}
-                className={`px-2.5 py-1 rounded-lg cursor-pointer transition-all flex items-center gap-1 text-[11px] font-bold border ${
-                  subtitleOutline
-                    ? 'bg-amber-400 text-slate-950 border-amber-300 font-black shadow-sm'
-                    : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-white'
-                }`}
-                title="Toggle Outline Stroke"
-              >
-                <span>🔲 Stroke</span>
-              </button>
-            </div>
-
-            {/* Tool 5: [Color Palette] */}
-            <div className="flex items-center gap-1.5 bg-slate-900/90 border border-slate-800 rounded-xl px-2.5 py-1 shrink-0 shadow-sm">
-              <span className="text-[10px] text-slate-400 font-bold shrink-0">Color:</span>
-              <div className="flex items-center gap-1.5 shrink-0">
-                {[
-                  { color: '#FFE600', label: 'Yellow' },
-                  { color: '#FFFFFF', label: 'White' },
-                  { color: '#22D3EE', label: 'Cyan' },
-                  { color: '#F59E0B', label: 'Amber' },
-                  { color: '#F43F5E', label: 'Rose' },
-                  { color: '#22C55E', label: 'Green' },
-                ].map((c) => (
-                  <button
-                    key={c.color}
-                    type="button"
-                    onClick={() => setSubtitleTextColor(c.color)}
-                    className={`w-5 h-5 rounded-full border transition-transform cursor-pointer ${
-                      subtitleTextColor === c.color ? 'scale-125 border-white ring-2 ring-cyan-400' : 'border-black/50 hover:scale-110'
-                    }`}
-                    style={{ backgroundColor: c.color }}
-                    title={c.label}
-                  />
-                ))}
-                <label className="relative cursor-pointer flex items-center ml-0.5" title="Custom Color">
-                  <input
-                    type="color"
-                    value={subtitleTextColor}
-                    onChange={(e) => setSubtitleTextColor(e.target.value)}
-                    className="w-5 h-5 rounded cursor-pointer opacity-0 absolute inset-0"
-                  />
-                  <Palette className="w-4 h-4 text-cyan-400 hover:text-cyan-300" />
-                </label>
-              </div>
-            </div>
-          </div>
-
-          {/* SECTION 3: AUDIO CONTROLS FOR MP4 EXPORT (Pre-Render Mixer) */}
-          <div className="w-full bg-[#0b1322] border border-cyan-500/30 rounded-2xl p-4 sm:p-5 flex flex-col gap-4 shadow-xl">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800">
-              <div className="flex items-center gap-2.5">
-                <div className="p-2 rounded-xl bg-cyan-500/10 border border-cyan-500/30 text-cyan-400">
-                  <Volume2 className="w-4 h-4" />
-                </div>
-                <div>
-                  <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
-                    <span>Audio Controls for MP4 Export</span>
-                    <span className="text-[10px] font-mono text-cyan-400 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800">
-                      Pre-Render Mixer
-                    </span>
-                  </h4>
-                  <p className="text-[11px] text-slate-400">
-                    ဗီဒီယို Export မထုတ်မီ မူရင်းဗီဒီယိုအသံ၊ AI အသံသွင်းနှင့် နောက်ခံတေးဂီတ အသံပမာဏများကို ချိန်ညှိပါ
-                  </p>
-                </div>
-              </div>
-
-              <div className="hidden sm:flex items-center gap-2">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setOriginalAudioVolume(0);
-                    setVoiceoverVolume(100);
-                    setBgmVolume(15);
-                  }}
-                  className="px-2 py-1 rounded bg-slate-900 hover:bg-slate-800 text-[11px] font-mono text-cyan-300 border border-slate-700 cursor-pointer"
-                >
-                  Reset Default
-                </button>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 pt-1">
-              {/* Slider 1: Original Video Audio */}
-              <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                    {originalAudioVolume === 0 ? (
-                      <VolumeX className="w-3.5 h-3.5 text-rose-400 shrink-0" />
-                    ) : (
-                      <Volume2 className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                    )}
-                    <span>Original Video Audio</span>
+              <div className="flex items-center gap-1 shrink-0 text-[10px] font-mono text-cyan-300">
+                <span className="px-1.5 py-0.5 rounded bg-cyan-950/70 border border-cyan-800/60 hidden sm:inline-block">
+                  16:9 HD
+                </span>
+                {originalAudioVolume === 0 && (
+                  <span className="px-1.5 py-0.5 rounded bg-rose-950/80 text-rose-300 border border-rose-800/80 flex items-center gap-0.5">
+                    <VolumeX className="w-3 h-3" />
+                    <span>0% Muted</span>
                   </span>
-                  <span className={`font-mono text-xs font-bold px-1.5 py-0.5 rounded ${
-                    originalAudioVolume === 0
-                      ? 'bg-rose-950/80 text-rose-300 border border-rose-800/80'
-                      : 'bg-cyan-950/80 text-cyan-300 border border-cyan-800/80'
-                  }`}>
-                    {originalAudioVolume === 0 ? 'Muted (0%)' : `${originalAudioVolume}%`}
-                  </span>
-                </div>
-
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  step="5"
-                  value={originalAudioVolume}
-                  onChange={(e) => setOriginalAudioVolume(parseInt(e.target.value))}
-                  className="w-full h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                />
-
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setOriginalAudioVolume(0)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${originalAudioVolume === 0 ? 'bg-rose-900/60 text-rose-200 font-bold' : ''}`}
-                  >
-                    Mute (0%)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setOriginalAudioVolume(20)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${originalAudioVolume === 20 ? 'bg-cyan-900/60 text-cyan-200 font-bold' : ''}`}
-                  >
-                    20%
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setOriginalAudioVolume(50)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${originalAudioVolume === 50 ? 'bg-cyan-900/60 text-cyan-200 font-bold' : ''}`}
-                  >
-                    50%
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setOriginalAudioVolume(100)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${originalAudioVolume === 100 ? 'bg-cyan-900/60 text-cyan-200 font-bold' : ''}`}
-                  >
-                    100%
-                  </button>
-                </div>
-              </div>
-
-              {/* Slider 2: AI Voiceover Volume */}
-              <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                    <Mic className="w-3.5 h-3.5 text-yellow-400 shrink-0" />
-                    <span>AI Voiceover Volume</span>
-                  </span>
-                  <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-yellow-950/80 text-yellow-300 border border-yellow-800/80">
-                    {voiceoverVolume}%
-                  </span>
-                </div>
-
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  step="5"
-                  value={voiceoverVolume}
-                  onChange={(e) => setVoiceoverVolume(parseInt(e.target.value))}
-                  className="w-full h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-yellow-400"
-                />
-
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setVoiceoverVolume(0)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${voiceoverVolume === 0 ? 'bg-rose-900/60 text-rose-200 font-bold' : ''}`}
-                  >
-                    Off (0%)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVoiceoverVolume(60)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${voiceoverVolume === 60 ? 'bg-yellow-900/60 text-yellow-200 font-bold' : ''}`}
-                  >
-                    60%
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVoiceoverVolume(80)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${voiceoverVolume === 80 ? 'bg-yellow-900/60 text-yellow-200 font-bold' : ''}`}
-                  >
-                    80%
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setVoiceoverVolume(100)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${voiceoverVolume === 100 ? 'bg-yellow-900/60 text-yellow-200 font-bold' : ''}`}
-                  >
-                    100%
-                  </button>
-                </div>
-              </div>
-
-              {/* Slider 3: Background Music (BGM) Volume */}
-              <div className="bg-slate-900/80 border border-slate-800 rounded-xl p-3.5 space-y-2">
-                <div className="flex items-center justify-between">
-                  <span className="text-xs font-bold text-slate-200 flex items-center gap-1.5">
-                    <Music className="w-3.5 h-3.5 text-purple-400 shrink-0" />
-                    <span>Background Music (BGM)</span>
-                  </span>
-                  <span className="font-mono text-xs font-bold px-1.5 py-0.5 rounded bg-purple-950/80 text-purple-300 border border-purple-800/80">
-                    {bgmVolume === 0 ? 'Off (0%)' : `${bgmVolume}%`}
-                  </span>
-                </div>
-
-                <input
-                  type="range"
-                  min="0"
-                  max="100"
-                  step="5"
-                  value={bgmVolume}
-                  onChange={(e) => setBgmVolume(parseInt(e.target.value))}
-                  className="w-full h-2 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-purple-400"
-                />
-
-                <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                  <button
-                    type="button"
-                    onClick={() => setBgmVolume(0)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${bgmVolume === 0 ? 'bg-purple-900/60 text-purple-200 font-bold' : ''}`}
-                  >
-                    Off (0%)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBgmVolume(15)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${bgmVolume === 15 ? 'bg-purple-900/60 text-purple-200 font-bold' : ''}`}
-                  >
-                    15% (Soft)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBgmVolume(30)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${bgmVolume === 30 ? 'bg-purple-900/60 text-purple-200 font-bold' : ''}`}
-                  >
-                    30%
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBgmVolume(50)}
-                    className={`px-1.5 py-0.5 rounded cursor-pointer hover:text-white ${bgmVolume === 50 ? 'bg-purple-900/60 text-purple-200 font-bold' : ''}`}
-                  >
-                    50%
-                  </button>
-                </div>
+                )}
               </div>
             </div>
-          </div>
 
-          {/* ========================================================================= */}
-          {/* STEP 3 ULTRA-COMPACT TABBED STUDIO CONTROLS (Mobile-Optimized Single Bar) */}
-          {/* ========================================================================= */}
-          <div className="bg-[#0f172a] border border-cyan-500/30 rounded-2xl p-3 sm:p-4 space-y-3.5 shadow-2xl">
-            {/* Single Tabbed Control Bar (Horizontal Scrollable on Mobile) */}
-            <div className="flex items-center gap-1.5 overflow-x-auto pb-1 scrollbar-none border-b border-slate-800">
-              {[
-                { id: 'subtitles', label: 'Subtitles & Text', icon: Edit3, badge: customSubtitleText ? `${customSubtitleText.length}c` : null },
-                { id: 'aspect', label: 'Size & Ratio', icon: Maximize2, badge: `${aspectRatio} • ${videoZoomScale}%` },
-                { id: 'blur', label: 'Blur Mask', icon: Shield, badge: blurMaskEnabled ? 'ON' : 'OFF' },
-                { id: 'color', label: 'Color Grade', icon: Palette, badge: colorGradingPreset.toUpperCase() },
-                { id: 'style', label: 'Style & Font', icon: FileText, badge: subtitleStyle.toUpperCase() },
-              ].map((tab) => {
-                const Icon = tab.icon;
-                const isActive = step3ActiveTab === tab.id;
-                return (
-                  <button
-                    key={tab.id}
-                    type="button"
-                    onClick={() => setStep3ActiveTab(tab.id as any)}
-                    className={`py-2 px-3 sm:px-3.5 rounded-xl font-bold text-xs transition-all duration-200 cursor-pointer flex items-center gap-1.5 shrink-0 border select-none ${
-                      isActive
-                        ? 'bg-gradient-to-r from-cyan-500 via-sky-400 to-blue-600 text-slate-950 border-cyan-300 shadow-md shadow-cyan-500/30 ring-1 ring-cyan-300 scale-[1.02]'
-                        : 'bg-slate-900/90 text-slate-400 border-slate-800 hover:border-slate-700 hover:text-slate-200'
-                    }`}
-                  >
-                    <Icon className="w-3.5 h-3.5 shrink-0" />
-                    <span>{tab.label}</span>
-                    {tab.badge && (
-                      <span
-                        className={`text-[9px] font-mono px-1.5 py-0.5 rounded-md ${
-                          isActive
-                            ? 'bg-slate-950/20 text-slate-950 font-black'
-                            : 'bg-slate-800 text-slate-400'
-                        }`}
-                      >
-                        {tab.badge}
+            {/* 2. BOTTOM-ANCHORED SCROLLABLE TOOLBAR (CapCut Style - Single line, NO Split/Cut button) */}
+            <div
+              className="w-full bg-[#080d18] border-t border-b border-slate-800/80 px-2 py-2 flex items-center gap-2 overflow-x-auto scrollbar-none select-none"
+              style={{
+                WebkitOverflowScrolling: 'touch',
+              }}
+            >
+              {/* Tool 1: ❄️ Freeze */}
+              <button
+                type="button"
+                onClick={() => setActiveCapCutTool(activeCapCutTool === 'freeze' ? null : 'freeze')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 border ${
+                  activeCapCutTool === 'freeze'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-lg shadow-cyan-500/20 font-black'
+                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <span>❄️ Freeze</span>
+                {isFreezeActive && <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping"></span>}
+              </button>
+
+              {/* Tool 2: 💬 Subtitles */}
+              <button
+                type="button"
+                onClick={() => setActiveCapCutTool(activeCapCutTool === 'subtitles' ? null : 'subtitles')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 border ${
+                  activeCapCutTool === 'subtitles'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-lg shadow-cyan-500/20 font-black'
+                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                <span>Subtitles</span>
+              </button>
+
+              {/* Tool 3: 🎨 Filters */}
+              <button
+                type="button"
+                onClick={() => setActiveCapCutTool(activeCapCutTool === 'filters' ? null : 'filters')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 border ${
+                  activeCapCutTool === 'filters'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-lg shadow-cyan-500/20 font-black'
+                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <Palette className="w-3.5 h-3.5" />
+                <span>Filters</span>
+                {colorGradingPreset !== 'normal' && (
+                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
+                )}
+              </button>
+
+              {/* Tool 4: 🎵 Audio */}
+              <button
+                type="button"
+                onClick={() => setActiveCapCutTool(activeCapCutTool === 'audio' ? null : 'audio')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 border ${
+                  activeCapCutTool === 'audio'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-lg shadow-cyan-500/20 font-black'
+                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <Volume2 className="w-3.5 h-3.5" />
+                <span>Audio</span>
+                {originalAudioVolume === 0 && (
+                  <span className="text-[9px] font-mono px-1 rounded bg-rose-500/30 text-rose-300">0%</span>
+                )}
+              </button>
+
+              {/* Tool 5: ⚙️ Canvas */}
+              <button
+                type="button"
+                onClick={() => setActiveCapCutTool(activeCapCutTool === 'canvas' ? null : 'canvas')}
+                className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all cursor-pointer flex items-center gap-1.5 shrink-0 border ${
+                  activeCapCutTool === 'canvas'
+                    ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-lg shadow-cyan-500/20 font-black'
+                    : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                }`}
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+                <span>Canvas</span>
+                {mirrorVideo && (
+                  <span className="text-[9px] font-mono px-1 rounded bg-amber-500/30 text-amber-300">🪞</span>
+                )}
+              </button>
+            </div>
+
+            {/* 3. POP-UP CONTROL SLIDERS (Placed directly below toolbar, never covering video) */}
+            {activeCapCutTool && (
+              <div className="bg-[#0b1322] border-t border-slate-800/80 p-3 sm:p-4 text-xs text-slate-300 space-y-3 animate-fadeIn">
+                {/* SUB-BAR 1: FREEZE */}
+                {activeCapCutTool === 'freeze' && (
+                  <div className="space-y-2.5">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white flex items-center gap-1.5">
+                        <span>❄️ Freeze Current Video Frame</span>
+                        <span className="text-[10px] font-normal text-slate-400">
+                          (ရပ်တန့်ကြည့်ရှုရန် အချိန်ရွေးချယ်ပါ)
+                        </span>
                       </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* TAB CONTENT 1: SUBTITLES & TEXT (With Dynamic Vertical Y-Position Slider) */}
-            {step3ActiveTab === 'subtitles' && (
-              <div className="space-y-3 animate-fadeIn">
-                {/* 1. DUAL-AXIS SUBTITLE POSITION CONTROLS (Y-AXIS & X-AXIS SLIDERS + ALIGNMENT BUTTONS) */}
-                <div className="bg-[#080d18] border border-cyan-500/30 rounded-xl p-3 space-y-3 shadow-md">
-                  {/* Y-Axis (Vertical) Slider */}
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-cyan-300 flex items-center gap-1.5">
-                        <SlidersHorizontal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                        <span>Vertical Position (Y-Axis):</span>
-                      </span>
-                      <span className="font-mono text-cyan-400 font-bold bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800 text-[11px]">
-                        {subtitleVerticalPos}% ({subtitleVerticalPos < 30 ? 'Top' : subtitleVerticalPos < 60 ? 'Middle' : subtitleVerticalPos < 80 ? 'Lower-Third' : 'Bottom'})
-                      </span>
+                      {isFreezeActive && (
+                        <span className="font-mono text-cyan-300 bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800 text-[10px] animate-pulse">
+                          Active (${freezeDurationSec}s)
+                        </span>
+                      )}
                     </div>
-
-                    <input
-                      type="range"
-                      min="5"
-                      max="90"
-                      step="1"
-                      value={subtitleVerticalPos}
-                      onChange={(e) => {
-                        const v = parseInt(e.target.value);
-                        setSubtitleVerticalPos(v);
-                        if (v < 30) setSubtitlePosition('top');
-                        else if (v < 60) setSubtitlePosition('middle');
-                        else if (v < 82) setSubtitlePosition('lower-third');
-                        else setSubtitlePosition('bottom');
-                      }}
-                      className="w-full h-2.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-
-                    {/* Quick Preset Buttons for Y-Axis */}
-                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                      {[
-                        { label: 'Top (10%)', val: 10, pos: 'top' },
-                        { label: 'Upper (25%)', val: 25, pos: 'top' },
-                        { label: 'Center (50%)', val: 50, pos: 'middle' },
-                        { label: 'TikTok (75%)', val: 75, pos: 'lower-third' },
-                        { label: 'Bottom (85%)', val: 85, pos: 'bottom' },
-                      ].map((item) => (
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-[11px] text-slate-400">Duration:</span>
+                      {[2, 3, 4, 5].map((sec) => (
                         <button
-                          key={item.label}
+                          key={sec}
                           type="button"
-                          onClick={() => { setSubtitleVerticalPos(item.val); setSubtitlePosition(item.pos as any); }}
-                          className={`px-1.5 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${subtitleVerticalPos === item.val ? 'text-cyan-400 font-bold bg-cyan-950/60' : ''}`}
+                          onClick={() => setFreezeDurationSec(sec)}
+                          className={`px-2.5 py-1 rounded-lg text-xs font-mono font-bold cursor-pointer transition-all border ${
+                            freezeDurationSec === sec
+                              ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-sm font-black'
+                              : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                          }`}
                         >
-                          {item.label}
+                          {sec}s
                         </button>
                       ))}
+                      <button
+                        type="button"
+                        onClick={handleFreezeFrame}
+                        disabled={isFreezeActive}
+                        className="ml-auto px-3.5 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 disabled:opacity-50 text-slate-950 font-bold text-xs cursor-pointer flex items-center gap-1.5 shadow-md transition-all active:scale-95"
+                      >
+                        <span>❄️ Freeze Frame Now</span>
+                      </button>
                     </div>
                   </div>
+                )}
 
-                  {/* X-Axis (Horizontal) Slider & Text Alignment Buttons */}
-                  <div className="pt-2 border-t border-slate-800/80 space-y-1.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-cyan-300 flex items-center gap-1.5">
-                        <SlidersHorizontal className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                        <span>Horizontal Position (X-Axis):</span>
-                      </span>
+                {/* SUB-BAR 2: SUBTITLES */}
+                {activeCapCutTool === 'subtitles' && (
+                  <div className="space-y-3">
+                    {/* Position Presets & Dual-Axis Offsets */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-slate-800/80">
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[11px] font-bold text-slate-300">Position Preset:</span>
+                        {(['top', 'center', 'bottom'] as const).map((preset) => (
+                          <button
+                            key={preset}
+                            type="button"
+                            onClick={() => {
+                              setSubtitlePositionPreset(preset);
+                              setSubtitleOffsetY(0);
+                            }}
+                            className={`px-2.5 py-1 rounded-lg text-[11px] font-bold capitalize transition-all cursor-pointer border ${
+                              subtitlePositionPreset === preset
+                                ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black shadow-sm'
+                                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-white'
+                            }`}
+                          >
+                            {preset}
+                          </button>
+                        ))}
+                      </div>
+
                       <div className="flex items-center gap-2">
-                        {/* Text Alignment Buttons (Left, Center, Right) */}
-                        <div className="flex items-center bg-slate-900 rounded-lg p-0.5 border border-slate-700">
-                          <button
-                            type="button"
-                            onClick={() => setSubtitleTextAlign('left')}
-                            title="Align Left"
-                            className={`p-1 rounded cursor-pointer transition-all ${
-                              subtitleTextAlign === 'left' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            <AlignLeft className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSubtitleTextAlign('center')}
-                            title="Align Center"
-                            className={`p-1 rounded cursor-pointer transition-all ${
-                              subtitleTextAlign === 'center' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            <AlignCenter className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => setSubtitleTextAlign('right')}
-                            title="Align Right"
-                            className={`p-1 rounded cursor-pointer transition-all ${
-                              subtitleTextAlign === 'right' ? 'bg-cyan-500 text-slate-950 font-bold' : 'text-slate-400 hover:text-white'
-                            }`}
-                          >
-                            <AlignRight className="w-3.5 h-3.5" />
-                          </button>
-                        </div>
-
-                        <span className="font-mono text-cyan-400 font-bold bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800 text-[11px]">
-                          {subtitleHorizontalPos}% ({subtitleHorizontalPos < 40 ? 'Left' : subtitleHorizontalPos > 60 ? 'Right' : 'Center'})
-                        </span>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setSubtitleOffsetX(0);
+                            setSubtitleOffsetY(0);
+                          }}
+                          className="text-[10px] font-mono text-slate-400 hover:text-cyan-300 underline cursor-pointer"
+                        >
+                          Reset Offsets (X:0, Y:0)
+                        </button>
                       </div>
                     </div>
 
-                    <input
-                      type="range"
-                      min="10"
-                      max="90"
-                      step="1"
-                      value={subtitleHorizontalPos}
-                      onChange={(e) => setSubtitleHorizontalPos(parseInt(e.target.value))}
-                      className="w-full h-2.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
+                    {/* Dual-axis sliders: X and Y offset */}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Horizontal (X Offset):</span>
+                          <span className="font-mono text-cyan-300">{subtitleOffsetX}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="-50"
+                          max="50"
+                          step="2"
+                          value={subtitleOffsetX}
+                          onChange={(e) => setSubtitleOffsetX(parseInt(e.target.value) || 0)}
+                          className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                      </div>
 
-                    {/* Quick Preset Buttons for X-Axis */}
-                    <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                      <button
-                        type="button"
-                        onClick={() => { setSubtitleHorizontalPos(20); setSubtitleTextAlign('left'); }}
-                        className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${subtitleHorizontalPos === 20 ? 'text-cyan-400 font-bold bg-cyan-950/60' : ''}`}
-                      >
-                        Left (20%)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => { setSubtitleHorizontalPos(50); setSubtitleTextAlign('center'); }}
-                        className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${subtitleHorizontalPos === 50 ? 'text-cyan-400 font-bold bg-cyan-950/60' : ''}`}
-                      >
-                        Center (50%)
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => { setSubtitleHorizontalPos(80); setSubtitleTextAlign('right'); }}
-                        className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${subtitleHorizontalPos === 80 ? 'text-cyan-400 font-bold bg-cyan-950/60' : ''}`}
-                      >
-                        Right (80%)
-                      </button>
-                    </div>
-                  </div>
-                </div>
-
-                {/* 2. Pure Burmese Subtitle Live Cue Display (Redundant Textarea Hidden) */}
-                <div className="bg-[#080d18] border border-slate-800 rounded-xl p-3 space-y-1.5 shadow-inner">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold text-slate-300 flex items-center gap-1.5">
-                      <FileText className="w-3.5 h-3.5 text-cyan-400" />
-                      <span>Live Synchronized Subtitle Preview (သန့်ရှင်းသော မြန်မာစာတန်းထိုး):</span>
-                    </span>
-                    <span className="text-[10px] font-mono text-emerald-400 bg-emerald-950/60 px-2 py-0.5 rounded border border-emerald-800">
-                      ✓ Pure Narrative Only (No JSON)
-                    </span>
-                  </div>
-                  <div className="p-2.5 rounded-lg bg-slate-950/90 border border-slate-800 text-xs sm:text-sm font-burmese text-amber-300 font-semibold leading-relaxed">
-                    "{cleanSubtitleForOverlay((isCustomSubtitleMode && customSubtitleText.trim()) ? customSubtitleText : (activeSubtitle || analyzedScriptResult?.segments?.[0]?.burmeseText || generatedRecap?.voiceoverScript?.hook || 'မြန်မာဘာသာ စာတန်းထိုးနှင့် အသံသွင်း Recap'))}"
-                  </div>
-                </div>
-
-                {/* 3. SUBTITLE FORMATTING TOOLBAR & FONT SIZE CONTROLLER (Requirement 6) */}
-                <div className="bg-[#080d18] border border-cyan-500/30 rounded-xl p-3.5 space-y-3.5 shadow-md">
-                  {/* Row A: Font Size Slider (12px - 32px) & Presets */}
-                  <div className="space-y-1.5">
-                    <div className="flex items-center justify-between text-xs">
-                      <span className="font-bold text-cyan-300 flex items-center gap-1.5">
-                        <Type className="w-3.5 h-3.5 text-cyan-400 shrink-0" />
-                        <span>Font Size Controller (12px - 32px):</span>
-                      </span>
-                      <span className="font-mono text-cyan-400 font-bold bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800 text-[11px]">
-                        {subtitleFontSize}px
-                      </span>
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Vertical (Y Offset):</span>
+                          <span className="font-mono text-cyan-300">{subtitleOffsetY}px</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="-80"
+                          max="80"
+                          step="2"
+                          value={subtitleOffsetY}
+                          onChange={(e) => setSubtitleOffsetY(parseInt(e.target.value) || 0)}
+                          className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                      </div>
                     </div>
 
-                    <input
-                      type="range"
-                      min="12"
-                      max="32"
-                      step="1"
-                      value={subtitleFontSize}
-                      onChange={(e) => setSubtitleFontSize(parseInt(e.target.value))}
-                      className="w-full h-2 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
+                    {/* Font Size & Formatting */}
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-800/80">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1">
+                          <Type className="w-3.5 h-3.5 text-cyan-400" />
+                          <span>Size:</span>
+                          <span className="font-mono text-cyan-300">{subtitleFontSize}px</span>
+                        </span>
+                        <input
+                          type="range"
+                          min="12"
+                          max="36"
+                          step="1"
+                          value={subtitleFontSize}
+                          onChange={(e) => setSubtitleFontSize(parseInt(e.target.value) || 18)}
+                          className="w-20 sm:w-28 h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                        <div className="flex items-center gap-1">
+                          {[14, 18, 22, 28].map((s) => (
+                            <button
+                              key={s}
+                              type="button"
+                              onClick={() => setSubtitleFontSize(s)}
+                              className={`px-1.5 py-0.5 rounded text-[10px] font-mono cursor-pointer border ${
+                                subtitleFontSize === s
+                                  ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-bold'
+                                  : 'bg-slate-900 text-slate-400 border-slate-800'
+                              }`}
+                            >
+                              {s}
+                            </button>
+                          ))}
+                        </div>
+                      </div>
 
-                    {/* Quick Presets: Small 14px, Medium 18px, Large 24px */}
-                    <div className="grid grid-cols-3 gap-1.5 pt-0.5">
-                      {[
-                        { label: 'Small (14px)', size: 14 },
-                        { label: 'Medium (18px)', size: 18 },
-                        { label: 'Large (24px)', size: 24 },
-                      ].map((preset) => (
-                        <button
-                          key={preset.size}
-                          type="button"
-                          onClick={() => setSubtitleFontSize(preset.size)}
-                          className={`py-1 px-1.5 rounded-lg text-center text-[11px] font-bold transition-all cursor-pointer border truncate ${
-                            subtitleFontSize === preset.size
-                              ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-sm font-black'
-                              : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-white'
-                          }`}
-                        >
-                          {preset.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  {/* Row B: Formatting Control Bar (Alignment, Style, Contrast Toggles) */}
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 pt-2 border-t border-slate-800/80">
-                    {/* Text Alignment */}
-                    <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800/80 space-y-1.5">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Alignment</span>
-                      <div className="grid grid-cols-3 gap-1">
+                      {/* Alignments & Styling Toggles */}
+                      <div className="flex items-center gap-1">
                         <button
                           type="button"
                           onClick={() => setSubtitleTextAlign('left')}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleTextAlign === 'left' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
+                          className={`p-1.5 rounded-lg border cursor-pointer ${
+                            subtitleTextAlign === 'left' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
                           title="Align Left"
                         >
                           <AlignLeft className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Left</span>
                         </button>
                         <button
                           type="button"
                           onClick={() => setSubtitleTextAlign('center')}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleTextAlign === 'center' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
+                          className={`p-1.5 rounded-lg border cursor-pointer ${
+                            subtitleTextAlign === 'center' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
                           title="Align Center"
                         >
                           <AlignCenter className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Center</span>
                         </button>
                         <button
                           type="button"
                           onClick={() => setSubtitleTextAlign('right')}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleTextAlign === 'right' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-300 border-slate-700 hover:border-slate-500'
+                          className={`p-1.5 rounded-lg border cursor-pointer ${
+                            subtitleTextAlign === 'right' ? 'bg-cyan-500 text-slate-950 border-cyan-300' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
                           title="Align Right"
                         >
                           <AlignRight className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Right</span>
                         </button>
-                      </div>
-                    </div>
 
-                    {/* Text Style: Bold, Italic, Background Box */}
-                    <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800/80 space-y-1.5">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Text Style</span>
-                      <div className="grid grid-cols-3 gap-1">
                         <button
                           type="button"
                           onClick={() => setSubtitleBold(!subtitleBold)}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleBold ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
+                          className={`px-2 py-1 rounded-lg border text-xs font-bold cursor-pointer ${
+                            subtitleBold ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
-                          title="Toggle Bold"
+                          title="Bold"
                         >
-                          <BoldIcon className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Bold</span>
+                          B
                         </button>
                         <button
                           type="button"
                           onClick={() => setSubtitleItalic(!subtitleItalic)}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleItalic ? 'bg-cyan-500 text-slate-950 border-cyan-300 italic' : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
+                          className={`px-2 py-1 rounded-lg border text-xs italic font-bold cursor-pointer ${
+                            subtitleItalic ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
-                          title="Toggle Italic"
+                          title="Italic"
                         >
-                          <ItalicIcon className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Italic</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setSubtitleBgBox(!subtitleBgBox)}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleBgBox ? 'bg-cyan-500 text-slate-950 border-cyan-300 font-bold' : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
-                          }`}
-                          title="Toggle Background Box"
-                        >
-                          <Square className="w-3.5 h-3.5" />
-                          <span className="text-[10px]">Box</span>
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Dynamic Shadow & Contrast Toggles */}
-                    <div className="bg-slate-950/70 p-2.5 rounded-lg border border-slate-800/80 space-y-1.5">
-                      <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Contrast & Shadow</span>
-                      <div className="grid grid-cols-2 gap-1">
-                        <button
-                          type="button"
-                          onClick={() => setSubtitleShadow(!subtitleShadow)}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleShadow ? 'bg-amber-400 text-slate-950 border-amber-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
-                          }`}
-                          title="Toggle Dynamic Shadow"
-                        >
-                          <span className="text-xs">🌑</span>
-                          <span className="text-[10px]">Shadow {subtitleShadow ? 'ON' : 'OFF'}</span>
+                          I
                         </button>
                         <button
                           type="button"
                           onClick={() => setSubtitleOutline(!subtitleOutline)}
-                          className={`py-1 rounded cursor-pointer transition-all flex items-center justify-center gap-1 text-xs font-bold border ${
-                            subtitleOutline ? 'bg-amber-400 text-slate-950 border-amber-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
+                          className={`px-2 py-1 rounded-lg border text-[11px] font-bold cursor-pointer ${
+                            subtitleOutline ? 'bg-amber-400 text-slate-950 border-amber-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-800'
                           }`}
-                          title="Toggle Outline Stroke"
+                          title="Outline Stroke"
                         >
-                          <span className="text-xs">🔲</span>
-                          <span className="text-[10px]">Outline {subtitleOutline ? 'ON' : 'OFF'}</span>
+                          Stroke
                         </button>
+                        <button
+                          type="button"
+                          onClick={() => setSubtitleShadow(!subtitleShadow)}
+                          className={`px-2 py-1 rounded-lg border text-[11px] font-bold cursor-pointer ${
+                            subtitleShadow ? 'bg-amber-400 text-slate-950 border-amber-300 font-black' : 'bg-slate-900 text-slate-400 border-slate-800'
+                          }`}
+                          title="Shadow"
+                        >
+                          Shadow
+                        </button>
+                      </div>
+
+                      {/* Color Palette Chips */}
+                      <div className="flex items-center gap-1.5">
+                        <span className="text-[10px] text-slate-400 font-bold">Color:</span>
+                        {[
+                          { color: '#FFE600', label: 'Yellow' },
+                          { color: '#FFFFFF', label: 'White' },
+                          { color: '#22D3EE', label: 'Cyan' },
+                          { color: '#F59E0B', label: 'Amber' },
+                          { color: '#22C55E', label: 'Green' },
+                        ].map((c) => (
+                          <button
+                            key={c.color}
+                            type="button"
+                            onClick={() => setSubtitleTextColor(c.color)}
+                            className={`w-4 h-4 rounded-full border transition-transform cursor-pointer ${
+                              subtitleTextColor === c.color ? 'scale-125 border-white ring-2 ring-cyan-400' : 'border-black/50 hover:scale-110'
+                            }`}
+                            style={{ backgroundColor: c.color }}
+                            title={c.label}
+                          />
+                        ))}
+                        <input
+                          type="color"
+                          value={subtitleTextColor}
+                          onChange={(e) => setSubtitleTextColor(e.target.value)}
+                          className="w-5 h-5 rounded bg-transparent cursor-pointer border-0 p-0"
+                          title="Custom Color"
+                        />
                       </div>
                     </div>
                   </div>
+                )}
 
-                  {/* Row C: Text Color Palette & Custom Picker */}
-                  <div className="pt-2 border-t border-slate-800/80 flex items-center justify-between flex-wrap gap-2">
-                    <span className="text-[11px] font-bold text-slate-400 flex items-center gap-1.5">
-                      <span>Text Color:</span>
-                      <span className="font-mono text-cyan-300 font-bold">{subtitleTextColor}</span>
-                    </span>
-                    <div className="flex items-center gap-1.5">
-                      {[
-                        { color: '#FFE600', label: 'Yellow', bg: 'bg-[#FFE600]' },
-                        { color: '#FFFFFF', label: 'White', bg: 'bg-white' },
-                        { color: '#22D3EE', label: 'Cyan', bg: 'bg-cyan-400' },
-                        { color: '#F59E0B', label: 'Amber', bg: 'bg-amber-500' },
-                        { color: '#F43F5E', label: 'Rose', bg: 'bg-rose-500' },
-                      ].map((c) => (
-                        <button
-                          key={c.color}
-                          type="button"
-                          onClick={() => {
-                            setSubtitleTextColor(c.color);
-                            if (c.color === '#FFE600') setSubtitleStyle('tiktok');
-                            else if (c.color === '#FFFFFF') setSubtitleStyle('cinema');
-                            else if (c.color === '#22D3EE') setSubtitleStyle('neon');
-                          }}
-                          className={`w-5 h-5 rounded-md ${c.bg} cursor-pointer transition-all ${subtitleTextColor === c.color ? 'ring-2 ring-white scale-110 shadow' : 'opacity-70 hover:opacity-100'}`}
-                          title={c.label}
-                        />
-                      ))}
-                      <input
-                        type="color"
-                        value={subtitleTextColor}
-                        onChange={(e) => setSubtitleTextColor(e.target.value)}
-                        className="w-6 h-6 rounded bg-transparent cursor-pointer border-0 p-0 ml-1"
-                        title="Custom Color"
-                      />
-                    </div>
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* TAB CONTENT 2: SIZE & ASPECT RATIO (Ultra-Compact 3-Button Bar) */}
-            {step3ActiveTab === 'aspect' && (
-              <div className="space-y-3 animate-fadeIn">
-                <div className="grid grid-cols-3 gap-2">
-                  {/* 16:9 Landscape */}
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('16:9')}
-                    className={`p-3 rounded-xl border text-center transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                      aspectRatio === '16:9'
-                        ? 'bg-gradient-to-br from-cyan-950 to-blue-950 border-cyan-400 text-white shadow-lg shadow-cyan-500/20 ring-1 ring-cyan-400'
-                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                    }`}
-                  >
-                    <span className="text-base">🎬</span>
-                    <span className="text-xs font-bold text-white">16:9 Landscape</span>
-                    <span className="text-[10px] text-cyan-300/80">YouTube / Cinema</span>
-                  </button>
-
-                  {/* 9:16 Portrait */}
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('9:16')}
-                    className={`p-3 rounded-xl border text-center transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                      aspectRatio === '9:16'
-                        ? 'bg-gradient-to-br from-amber-950 to-orange-950 border-amber-400 text-white shadow-lg shadow-amber-500/20 ring-1 ring-amber-400'
-                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                    }`}
-                  >
-                    <span className="text-base">📱</span>
-                    <span className="text-xs font-bold text-white">9:16 Portrait</span>
-                    <span className="text-[10px] text-amber-300/80">TikTok / Reels / Shorts</span>
-                  </button>
-
-                  {/* 1:1 Square */}
-                  <button
-                    type="button"
-                    onClick={() => setAspectRatio('1:1')}
-                    className={`p-3 rounded-xl border text-center transition-all duration-200 cursor-pointer flex flex-col items-center justify-center gap-1 ${
-                      aspectRatio === '1:1'
-                        ? 'bg-gradient-to-br from-purple-950 to-pink-950 border-purple-400 text-white shadow-lg shadow-purple-500/20 ring-1 ring-purple-400'
-                        : 'bg-slate-900/80 border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700'
-                    }`}
-                  >
-                    <span className="text-base">🔳</span>
-                    <span className="text-xs font-bold text-white">1:1 Square</span>
-                    <span className="text-[10px] text-purple-300/80">Facebook / IG Feed</span>
-                  </button>
-                </div>
-
-                {/* 🔍 Video Zoom / Fit Scale Slider (50% to 200%, default: 100%) */}
-                <div className="bg-[#080d18] border border-cyan-500/30 rounded-xl p-3 space-y-2.5 shadow-md">
-                  <div className="flex items-center justify-between text-xs">
-                    <span className="font-bold text-white flex items-center gap-1.5">
-                      <span className="text-cyan-400">🔍</span>
-                      <span>Video Zoom / Fit Scale:</span>
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <span className="font-mono text-cyan-400 font-bold bg-cyan-950/80 px-2 py-0.5 rounded border border-cyan-800 text-[11px]">
-                        {videoZoomScale}% {videoZoomScale === 100 ? '(Fit 1:1)' : videoZoomScale > 100 ? `(+${videoZoomScale - 100}% Zoom)` : `(${videoZoomScale}% Shrink)`}
+                {/* SUB-BAR 3: FILTERS */}
+                {activeCapCutTool === 'filters' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white flex items-center gap-1.5">
+                        <Palette className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Color Grading Presets (ရုပ်ရှင်အဆင့် အရောင်ဖော်မြူလာ)</span>
                       </span>
-                      {videoZoomScale !== 100 && (
+                      <button
+                        type="button"
+                        onClick={() => handleApplyColorPreset('normal')}
+                        className="text-[10px] text-slate-400 hover:text-cyan-300 underline cursor-pointer"
+                      >
+                        Reset to Normal
+                      </button>
+                    </div>
+
+                    <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
+                      {[
+                        { id: 'normal', label: 'Normal', icon: '☀️' },
+                        { id: 'moody', label: 'Moody', icon: '🌑' },
+                        { id: 'vintage', label: 'Vintage', icon: '🎞️' },
+                        { id: 'vibrant', label: 'Vibrant', icon: '✨' },
+                        { id: 'noir', label: 'Film Noir', icon: '🖤' },
+                        { id: 'cyberpunk', label: 'Cyberpunk', icon: '⚡' },
+                      ].map((item) => (
                         <button
+                          key={item.id}
                           type="button"
-                          onClick={() => setVideoZoomScale(100)}
-                          className="text-[10px] text-slate-400 hover:text-cyan-300 font-mono underline cursor-pointer"
+                          onClick={() => handleApplyColorPreset(item.id as any)}
+                          className={`p-2 rounded-xl text-center border transition-all cursor-pointer flex flex-col items-center gap-1 ${
+                            colorGradingPreset === item.id
+                              ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400 shadow-md font-bold'
+                              : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                          }`}
                         >
-                          Reset
+                          <span className="text-base">{item.icon}</span>
+                          <span className="text-[11px]">{item.label}</span>
                         </button>
-                      )}
+                      ))}
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-2 border-t border-slate-800/80">
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Brightness:</span>
+                          <span className="font-mono text-cyan-300">{brightness}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="60"
+                          max="150"
+                          value={brightness}
+                          onChange={(e) => setBrightness(parseInt(e.target.value) || 100)}
+                          className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Contrast:</span>
+                          <span className="font-mono text-cyan-300">{contrast}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="60"
+                          max="180"
+                          value={contrast}
+                          onChange={(e) => setContrast(parseInt(e.target.value) || 100)}
+                          className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <div className="flex items-center justify-between text-[11px]">
+                          <span className="text-slate-400">Saturation:</span>
+                          <span className="font-mono text-cyan-300">{saturation}%</span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="200"
+                          value={saturation}
+                          onChange={(e) => setSaturation(parseInt(e.target.value) || 100)}
+                          className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                      </div>
                     </div>
                   </div>
+                )}
 
-                  <input
-                    type="range"
-                    min="50"
-                    max="200"
-                    step="1"
-                    value={videoZoomScale}
-                    onChange={(e) => setVideoZoomScale(parseInt(e.target.value) || 100)}
-                    className="w-full h-2.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                  />
+                {/* SUB-BAR 4: AUDIO */}
+                {activeCapCutTool === 'audio' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white flex items-center gap-1.5">
+                        <Volume2 className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Multi-Track Audio Mixers (0% = Absolute Mute)</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setOriginalAudioVolume(0);
+                          setVoiceoverVolume(100);
+                          setBgmVolume(15);
+                        }}
+                        className="text-[10px] text-slate-400 hover:text-cyan-300 underline cursor-pointer"
+                      >
+                        Reset Defaults (0%, 100%, 15%)
+                      </button>
+                    </div>
 
-                  {/* Preset Quick Buttons */}
-                  <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 pt-0.5">
-                    <button
-                      type="button"
-                      onClick={() => setVideoZoomScale(75)}
-                      className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${videoZoomScale === 75 ? 'text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800' : 'bg-slate-900/60'}`}
-                    >
-                      75% Wide
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setVideoZoomScale(100)}
-                      className={`px-2.5 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${videoZoomScale === 100 ? 'text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800' : 'bg-slate-900/60'}`}
-                    >
-                      100% Fit (Default)
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setVideoZoomScale(125)}
-                      className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${videoZoomScale === 125 ? 'text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800' : 'bg-slate-900/60'}`}
-                    >
-                      125% Fill
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setVideoZoomScale(150)}
-                      className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${videoZoomScale === 150 ? 'text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800' : 'bg-slate-900/60'}`}
-                    >
-                      150% Zoom
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setVideoZoomScale(175)}
-                      className={`px-2 py-0.5 rounded hover:text-cyan-300 cursor-pointer ${videoZoomScale === 175 ? 'text-cyan-400 font-bold bg-cyan-950/60 border border-cyan-800' : 'bg-slate-900/60'}`}
-                    >
-                      175% Close-up
-                    </button>
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                      {/* Original Video Audio */}
+                      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1">
+                            {originalAudioVolume === 0 ? <VolumeX className="w-3.5 h-3.5 text-rose-400" /> : <Volume2 className="w-3.5 h-3.5 text-cyan-400" />}
+                            <span>Original Audio</span>
+                          </span>
+                          <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded font-bold ${
+                            originalAudioVolume === 0 ? 'bg-rose-950 text-rose-300 border border-rose-800' : 'bg-cyan-950 text-cyan-300'
+                          }`}>
+                            {originalAudioVolume === 0 ? '0% (Muted)' : `${originalAudioVolume}%`}
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={originalAudioVolume}
+                          onChange={(e) => setOriginalAudioVolume(parseInt(e.target.value) || 0)}
+                          className="w-full h-1.5 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                        <div className="flex items-center justify-between text-[10px] text-slate-500">
+                          <button type="button" onClick={() => setOriginalAudioVolume(0)} className="hover:text-rose-400 cursor-pointer">0%</button>
+                          <button type="button" onClick={() => setOriginalAudioVolume(20)} className="hover:text-slate-300 cursor-pointer">20%</button>
+                          <button type="button" onClick={() => setOriginalAudioVolume(50)} className="hover:text-slate-300 cursor-pointer">50%</button>
+                          <button type="button" onClick={() => setOriginalAudioVolume(100)} className="hover:text-slate-300 cursor-pointer">100%</button>
+                        </div>
+                      </div>
+
+                      {/* AI Voiceover */}
+                      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1">
+                            <Mic className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>AI Voiceover</span>
+                          </span>
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 font-bold">
+                            {voiceoverVolume}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="100"
+                          step="5"
+                          value={voiceoverVolume}
+                          onChange={(e) => setVoiceoverVolume(parseInt(e.target.value) || 0)}
+                          className="w-full h-1.5 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                        <div className="flex items-center justify-between text-[10px] text-slate-500">
+                          <button type="button" onClick={() => setVoiceoverVolume(0)} className="hover:text-slate-300 cursor-pointer">0%</button>
+                          <button type="button" onClick={() => setVoiceoverVolume(50)} className="hover:text-slate-300 cursor-pointer">50%</button>
+                          <button type="button" onClick={() => setVoiceoverVolume(80)} className="hover:text-slate-300 cursor-pointer">80%</button>
+                          <button type="button" onClick={() => setVoiceoverVolume(100)} className="hover:text-cyan-300 cursor-pointer">100%</button>
+                        </div>
+                      </div>
+
+                      {/* BGM Volume */}
+                      <div className="bg-slate-900/90 border border-slate-800 rounded-xl p-2.5 space-y-1.5">
+                        <div className="flex items-center justify-between">
+                          <span className="text-[11px] font-bold text-slate-300 flex items-center gap-1">
+                            <Music className="w-3.5 h-3.5 text-cyan-400" />
+                            <span>BGM Volume</span>
+                          </span>
+                          <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-cyan-950 text-cyan-300 font-bold">
+                            {bgmVolume}%
+                          </span>
+                        </div>
+                        <input
+                          type="range"
+                          min="0"
+                          max="50"
+                          step="5"
+                          value={bgmVolume}
+                          onChange={(e) => setBgmVolume(parseInt(e.target.value) || 0)}
+                          className="w-full h-1.5 bg-slate-950 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                        <div className="flex items-center justify-between text-[10px] text-slate-500">
+                          <button type="button" onClick={() => setBgmVolume(0)} className="hover:text-slate-300 cursor-pointer">0%</button>
+                          <button type="button" onClick={() => setBgmVolume(15)} className="hover:text-cyan-300 cursor-pointer">15%</button>
+                          <button type="button" onClick={() => setBgmVolume(30)} className="hover:text-slate-300 cursor-pointer">30%</button>
+                          <button type="button" onClick={() => setBgmVolume(50)} className="hover:text-slate-300 cursor-pointer">50%</button>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex items-center justify-between pt-1">
+                      <label className="flex items-center gap-2 cursor-pointer text-xs font-bold text-slate-300">
+                        <input
+                          type="checkbox"
+                          checked={isSyncAudioWithVideo}
+                          onChange={(e) => setIsSyncAudioWithVideo(e.target.checked)}
+                          className="w-4 h-4 rounded bg-slate-900 border-slate-700 text-cyan-500 focus:ring-0 cursor-pointer"
+                        />
+                        <span>Auto-Sync Audio with Video Playhead</span>
+                      </label>
+                      <span className="text-[10px] font-mono text-cyan-400">
+                        {syncDriftStatus.statusText}
+                      </span>
+                    </div>
                   </div>
-                </div>
+                )}
 
-                {/* Mirror Video (Horizontal Flip) Toggle Control */}
-                <div className="bg-[#080d18] border border-cyan-500/30 rounded-xl p-3 flex items-center justify-between shadow-md">
-                  <div className="space-y-0.5">
-                    <div className="text-xs font-bold text-white flex items-center gap-1.5">
-                      <span>🪞 Mirror Video (Horizontal Flip)</span>
-                      {mirrorVideo ? (
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-amber-400/20 text-amber-300 border border-amber-400/40">
-                          Active (Flip ON)
+                {/* SUB-BAR 5: CANVAS */}
+                {activeCapCutTool === 'canvas' && (
+                  <div className="space-y-3">
+                    <div className="flex items-center justify-between">
+                      <span className="font-bold text-white flex items-center gap-1.5">
+                        <Maximize2 className="w-3.5 h-3.5 text-cyan-400" />
+                        <span>Canvas & Transformation (Aspect Ratio / Mirror / Zoom)</span>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-3 gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setAspectRatio('16:9')}
+                        className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center gap-1 ${
+                          aspectRatio === '16:9'
+                            ? 'bg-cyan-500/20 text-cyan-300 border-cyan-400 shadow-md font-bold'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                        }`}
+                      >
+                        <span className="text-base">🎬</span>
+                        <span className="text-xs font-bold">16:9 Landscape</span>
+                        <span className="text-[10px] text-slate-400">YouTube</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setAspectRatio('9:16')}
+                        className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center gap-1 ${
+                          aspectRatio === '9:16'
+                            ? 'bg-amber-500/20 text-amber-300 border-amber-400 shadow-md font-bold'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                        }`}
+                      >
+                        <span className="text-base">📱</span>
+                        <span className="text-xs font-bold">9:16 Portrait</span>
+                        <span className="text-[10px] text-slate-400">TikTok / Reels</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => setAspectRatio('1:1')}
+                        className={`p-2.5 rounded-xl border text-center transition-all cursor-pointer flex flex-col items-center gap-1 ${
+                          aspectRatio === '1:1'
+                            ? 'bg-purple-500/20 text-purple-300 border-purple-400 shadow-md font-bold'
+                            : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+                        }`}
+                      >
+                        <span className="text-base">🔳</span>
+                        <span className="text-xs font-bold">1:1 Square</span>
+                        <span className="text-[10px] text-slate-400">Instagram</span>
+                      </button>
+                    </div>
+
+                    <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-800/80">
+                      {/* Mirror Video Toggle */}
+                      <button
+                        type="button"
+                        onClick={() => setMirrorVideo(!mirrorVideo)}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all border flex items-center gap-1.5 ${
+                          mirrorVideo
+                            ? 'bg-amber-400 text-slate-950 border-amber-300 shadow-md font-black'
+                            : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <span>🪞 Mirror Video (Horizontal Flip)</span>
+                        <span className={`text-[10px] font-mono px-1.5 rounded ${mirrorVideo ? 'bg-black text-amber-300' : 'bg-slate-800 text-slate-400'}`}>
+                          {mirrorVideo ? 'ON' : 'OFF'}
                         </span>
-                      ) : (
-                        <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-slate-800 text-slate-400 border border-slate-700">
-                          Normal (Flip OFF)
+                      </button>
+
+                      {/* Cover Subtitles (Blur Mask) Toggle */}
+                      <button
+                        type="button"
+                        onClick={() => setBlurMaskEnabled(!blurMaskEnabled)}
+                        className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all border flex items-center gap-1.5 ${
+                          blurMaskEnabled
+                            ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-md font-black'
+                            : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
+                        }`}
+                      >
+                        <span>🌫️ Cover Subtitles (Blur Mask)</span>
+                        <span className={`text-[10px] font-mono px-1.5 rounded ${blurMaskEnabled ? 'bg-black text-cyan-300' : 'bg-slate-800 text-slate-400'}`}>
+                          {blurMaskEnabled ? 'ON' : 'OFF'}
                         </span>
-                      )}
-                    </div>
-                    <p className="text-[11px] text-slate-400">
-                      ဗီဒီယိုအား ဘယ်/ညာ ပြောင်းပြန်လှန်ပြီး Render ထုတ်ပေးပါသည် (Copyright Strike ကာကွယ်ရန်)
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setMirrorVideo(!mirrorVideo)}
-                    className={`relative inline-flex h-6 w-12 items-center rounded-full transition-colors cursor-pointer border ${
-                      mirrorVideo ? 'bg-amber-400 border-amber-300' : 'bg-slate-800 border-slate-700'
-                    }`}
-                  >
-                    <span
-                      className={`inline-block h-4 w-4 transform rounded-full bg-slate-950 transition-transform ${
-                        mirrorVideo ? 'translate-x-6' : 'translate-x-1'
-                      }`}
-                    />
-                  </button>
-                </div>
-              </div>
-            )}
+                      </button>
 
-            {/* TAB CONTENT 3: BLUR MASK CONTROLS */}
-            {step3ActiveTab === 'blur' && (
-              <div className="space-y-3 animate-fadeIn">
-                <div className="flex items-center justify-between pb-1 border-b border-slate-800">
-                  <div className="flex items-center gap-2">
-                    <span className="text-xs font-bold text-slate-200">Blur Original Subtitles:</span>
-                    <span className={`text-[10px] font-mono px-2 py-0.5 rounded-full ${blurMaskEnabled ? 'bg-cyan-950 text-cyan-300 border border-cyan-800' : 'bg-slate-900 text-slate-500'}`}>
-                      {blurMaskEnabled ? 'Mask Active' : 'Mask Inactive'}
-                    </span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => setBlurMaskEnabled(!blurMaskEnabled)}
-                    className={`px-3 py-1 rounded-xl font-bold text-xs cursor-pointer border ${
-                      blurMaskEnabled
-                        ? 'bg-cyan-500 text-slate-950 border-cyan-300 shadow-sm'
-                        : 'bg-slate-900 text-slate-400 border-slate-700 hover:text-white'
-                    }`}
-                  >
-                    {blurMaskEnabled ? '✓ Enabled' : 'Enable Mask'}
-                  </button>
-                </div>
-
-                {/* Alignment Presets */}
-                <div className="flex items-center gap-1.5 text-[10px]">
-                  <span className="text-slate-500 font-mono">Presets:</span>
-                  <button
-                    type="button"
-                    onClick={() => { setBlurMaskEnabled(true); setBlurMaskY(82); setBlurMaskHeight(14); setBlurMaskWidth(94); setBlurMaskIntensity(16); }}
-                    className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-cyan-300 border border-slate-800 cursor-pointer"
-                  >
-                    Bottom Standard
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setBlurMaskEnabled(true); setBlurMaskY(76); setBlurMaskHeight(16); setBlurMaskWidth(96); setBlurMaskIntensity(20); }}
-                    className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-amber-300 border border-slate-800 cursor-pointer"
-                  >
-                    TikTok
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => { setBlurMaskEnabled(true); setBlurMaskY(86); setBlurMaskHeight(10); setBlurMaskWidth(98); setBlurMaskIntensity(14); }}
-                    className="px-2 py-0.5 rounded bg-slate-900 hover:bg-slate-800 text-purple-300 border border-slate-800 cursor-pointer"
-                  >
-                    Cinema Slim
-                  </button>
-                </div>
-
-                {/* Compact Sliders Grid */}
-                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-0.5">
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Y-Pos:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{blurMaskY}%</span>
+                      {/* Zoom Scale */}
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-slate-400">Zoom:</span>
+                        <input
+                          type="range"
+                          min="50"
+                          max="200"
+                          step="5"
+                          value={videoZoomScale}
+                          onChange={(e) => setVideoZoomScale(parseInt(e.target.value) || 100)}
+                          className="w-20 sm:w-28 h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                        />
+                        <span className="font-mono text-[11px] text-cyan-300">{videoZoomScale}%</span>
+                        {videoZoomScale !== 100 && (
+                          <button
+                            type="button"
+                            onClick={() => setVideoZoomScale(100)}
+                            className="text-[10px] text-slate-400 hover:text-white underline cursor-pointer"
+                          >
+                            Reset
+                          </button>
+                        )}
+                      </div>
                     </div>
-                    <input
-                      type="range"
-                      min="50"
-                      max="94"
-                      value={blurMaskY}
-                      onChange={(e) => setBlurMaskY(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
                   </div>
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Height:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{blurMaskHeight}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="6"
-                      max="28"
-                      value={blurMaskHeight}
-                      onChange={(e) => setBlurMaskHeight(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Intensity:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{blurMaskIntensity}px</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="4"
-                      max="32"
-                      value={blurMaskIntensity}
-                      onChange={(e) => setBlurMaskIntensity(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Opacity:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{blurMaskOpacity}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="20"
-                      max="100"
-                      value={blurMaskOpacity}
-                      onChange={(e) => setBlurMaskOpacity(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* TAB CONTENT 4: COLOR GRADING CONTROLS */}
-            {step3ActiveTab === 'color' && (
-              <div className="space-y-3 animate-fadeIn">
-                {/* 6 Presets Grid */}
-                <div className="grid grid-cols-3 sm:grid-cols-6 gap-2">
-                  {[
-                    { id: 'normal', label: '⚖️ Normal' },
-                    { id: 'moody', label: '🌑 Moody' },
-                    { id: 'vintage', label: '🎞️ Vintage' },
-                    { id: 'vibrant', label: '✨ Vibrant' },
-                    { id: 'noir', label: '🎬 Noir' },
-                    { id: 'cyberpunk', label: '⚡ Cyber' },
-                  ].map((p) => (
-                    <button
-                      key={p.id}
-                      type="button"
-                      onClick={() => handleApplyColorPreset(p.id as any)}
-                      className={`py-2 px-1.5 rounded-xl text-[11px] font-bold border transition-all cursor-pointer truncate text-center ${
-                        colorGradingPreset === p.id
-                          ? 'bg-cyan-500/25 border-cyan-400 text-cyan-300 shadow-sm font-black'
-                          : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
-                      }`}
-                    >
-                      {p.label}
-                    </button>
-                  ))}
-                </div>
-
-                {/* 3 Color Sliders in 1 Row */}
-                <div className="grid grid-cols-3 gap-2 pt-0.5">
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Brightness:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{brightness}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="50"
-                      max="150"
-                      value={brightness}
-                      onChange={(e) => setBrightness(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Contrast:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{contrast}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="50"
-                      max="200"
-                      value={contrast}
-                      onChange={(e) => setContrast(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                  <div className="bg-[#080d18] p-2 rounded-xl border border-slate-800 space-y-1">
-                    <div className="flex justify-between text-xs">
-                      <span className="text-slate-300">Saturation:</span>
-                      <span className="font-mono text-cyan-400 font-bold">{saturation}%</span>
-                    </div>
-                    <input
-                      type="range"
-                      min="0"
-                      max="200"
-                      value={saturation}
-                      onChange={(e) => setSaturation(parseInt(e.target.value))}
-                      className="w-full h-1.5 bg-slate-900 rounded-lg appearance-none cursor-pointer accent-cyan-400"
-                    />
-                  </div>
-                </div>
-              </div>
-            )}
-
-            {/* TAB CONTENT 5: STYLE & FONT (Custom Dark Dropdowns) */}
-            {step3ActiveTab === 'style' && (
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 animate-fadeIn">
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-400 mb-1">
-                    Burmese Font
-                  </label>
-                  <CustomDarkDropdown
-                    value={subtitleFont}
-                    onChange={(val) => setSubtitleFont(val as any)}
-                    theme="cyan"
-                    buttonClassName="!py-2 !px-2.5 !text-xs"
-                    options={[
-                      { value: 'padauk', label: 'Padauk Font (ရုပ်ရှင်ဖောင့်)', description: 'Cinematic Myanmar font', badge: 'Default' },
-                      { value: 'noto', label: 'Noto Sans Myanmar', description: 'Google clean UI font' },
-                      { value: 'myanmar-text', label: 'Myanmar Text Bold', description: 'Heavy-weight subtitle typography' },
-                      { value: 'sans', label: 'Plus Jakarta Sans', description: 'Clean modern English font' },
-                    ]}
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-400 mb-1">
-                    Color Theme
-                  </label>
-                  <CustomDarkDropdown
-                    value={subtitleStyle}
-                    onChange={(val) => setSubtitleStyle(val as any)}
-                    theme="amber"
-                    buttonClassName="!py-2 !px-2.5 !text-xs"
-                    options={[
-                      { value: 'tiktok', label: 'TikTok Yellow (#FFE600)', description: 'Viral yellow with black stroke', badge: 'Popular' },
-                      { value: 'cinema', label: 'Cinema Crisp White', description: 'Clean white with drop shadow' },
-                      { value: 'neon', label: 'Cyberpunk Cyan Glow', description: 'Neon cyan border glow' },
-                      { value: 'boxed', label: 'Dark Slate Boxed', description: 'Slate-900 box' },
-                    ]}
-                  />
-                </div>
-                <div>
-                  <label className="block text-[11px] font-bold text-slate-400 mb-1">
-                    Position Preset
-                  </label>
-                  <CustomDarkDropdown
-                    value={subtitlePosition}
-                    onChange={(val) => {
-                      setSubtitlePosition(val as any);
-                      if (val === 'top') setSubtitleVerticalPos(10);
-                      else if (val === 'middle') setSubtitleVerticalPos(50);
-                      else if (val === 'lower-third') setSubtitleVerticalPos(75);
-                      else setSubtitleVerticalPos(85);
-                    }}
-                    theme="blue"
-                    buttonClassName="!py-2 !px-2.5 !text-xs"
-                    options={[
-                      { value: 'bottom', label: 'Bottom (85%)', description: 'Standard bottom center placement' },
-                      { value: 'lower-third', label: 'Lower-Third (75%)', description: 'Above TikTok overlay controls' },
-                      { value: 'middle', label: 'Center (50%)', description: 'Center frame focus' },
-                      { value: 'top', label: 'Top (10%)', description: 'Upper position' },
-                    ]}
-                  />
-                </div>
+                )}
               </div>
             )}
           </div>

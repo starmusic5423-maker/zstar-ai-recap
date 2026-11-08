@@ -156,3 +156,29 @@ export interface SplitVideoResult {
   message: string;
 }
 
+export interface MovieSummaryCharacter {
+  name: string;
+  role: string;
+  description: string;
+}
+
+export interface MovieSummaryTheme {
+  name: string;
+  description: string;
+}
+
+export interface MovieSummary {
+  movieTitle: string;
+  burmeseTitle?: string;
+  releaseYear?: string;
+  genre?: string[];
+  tagline?: string;
+  shortSummary: string;
+  mainPlot: string;
+  characters: MovieSummaryCharacter[];
+  themes: MovieSummaryTheme[];
+  burmeseSummary: string;
+  keyTakeaway?: string;
+}
+
+
