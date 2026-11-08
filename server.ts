@@ -155,13 +155,12 @@ function cleanApiKey(key?: string | null): string {
   return str;
 }
 
-// Check if API key is missing, empty, dummy placeholder, stale env name, or internal GCP OAuth token
+// Check if API key is missing, empty, or dummy placeholder
 function isKeyInvalid(key?: string | null): boolean {
   if (!key) return true;
   const cleaned = cleanApiKey(key);
-  if (!cleaned) return true;
-  if (cleaned.length < 15) return true;
-  if (/^(your_gemini_api_key_here|your_api_key|undefined|null|placeholder|gemini_api_key|vite_gemini_api_key|api_key|custom_gemini_api_key)$/i.test(cleaned)) return true;
+  if (!cleaned || cleaned.trim().length < 20) return true; // Real Gemini API keys from Google AI Studio are 39 chars long
+  if (/^(your_gemini_api_key_here|your_api_key|undefined|null|placeholder|gemini_api_key|vite_gemini_api_key|api_key|key)$/i.test(cleaned.trim())) return true;
   if (cleaned.startsWith('AQ.')) return true; // GCP OAuth access token mistakenly passed as Gemini API Key
   return false;
 }
@@ -1871,6 +1870,13 @@ function extractPureBurmeseCommentary(rawParsed: any, rawText: string, fallbackT
   };
 }
 
+function cleanIntroCliches(str: string): string {
+  if (!str) return '';
+  return str
+    .replace(/^(?:ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့|ဒီဗီဒီယိုမှာတော့|ဒီဗီဒီယိုထဲမှာတော့|ဒီဇာတ်လမ်းလေးကတော့|ပထမဦးစွာ\s*ဇာတ်လမ်းအစမှာတော့|ဒီရုပ်ရှင်ရဲ့\s*အဓိကဇာတ်ကွက်|ဇာတ်လမ်းအစမှာတော့)\s*[,၊။]?\s*/gi, '')
+    .trim();
+}
+
 function safeParseGeminiVideoAnalysis(rawText: string, fallbackTitle: string, durationSec = 240, isCommentary = false): any {
   if (!rawText || !rawText.trim()) {
     return null;
@@ -1880,13 +1886,43 @@ function safeParseGeminiVideoAnalysis(rawText: string, fallbackTitle: string, du
     const cleaned = sanitizeGeminiJson(rawText);
     const parsed = JSON.parse(cleaned);
 
+    // If Gemini returned structured segments, directly utilize them with clean text
+    if (parsed && Array.isArray(parsed.segments) && parsed.segments.length > 0) {
+      const sanitizedSegments = parsed.segments.map((seg: any, idx: number) => {
+        const rawBurmese = typeof seg === 'string' ? seg : (seg.burmeseText || seg.text || '');
+        const cleanText = cleanIntroCliches(rawBurmese);
+        const sSec = typeof seg.startSeconds === 'number' ? seg.startSeconds : Math.round((idx * (durationSec / parsed.segments.length)) * 10) / 10;
+        const eSec = typeof seg.endSeconds === 'number' ? seg.endSeconds : Math.round(Math.min(durationSec, sSec + (durationSec / parsed.segments.length)) * 10) / 10;
+        return {
+          id: idx + 1,
+          startSeconds: sSec,
+          endSeconds: eSec,
+          startTime: seg.startTime || formatSecondsToTime(sSec),
+          endTime: seg.endTime || formatSecondsToTime(eSec),
+          timestamp: seg.timestamp || `${formatSecondsToTime(sSec)} - ${formatSecondsToTime(eSec)}`,
+          speaker: seg.speaker || (isCommentary ? '[Narrator] ဇာတ်လမ်းပြောသူ' : 'ဇာတ်ကောင်'),
+          gender: seg.gender || (isCommentary ? 'narrator' : 'male'),
+          visualDescription: seg.visualDescription || '',
+          burmeseText: cleanText || rawBurmese,
+        };
+      });
+
+      const fullScript = parsed.fullBurmeseScript
+        ? cleanIntroCliches(parsed.fullBurmeseScript)
+        : sanitizedSegments.map((s: any) => s.burmeseText).join(' ');
+
+      return {
+        videoTitle: parsed.videoTitle || fallbackTitle,
+        detectedLanguage: parsed.detectedLanguage || 'Burmese',
+        summary: cleanIntroCliches(parsed.summary || sanitizedSegments[0]?.burmeseText || `${fallbackTitle} ဇာတ်ညွှန်း`),
+        segments: sanitizedSegments,
+        fullBurmeseScript: fullScript,
+      };
+    }
+
     if (isCommentary) {
       const pure = extractPureBurmeseCommentary(parsed, rawText, fallbackTitle, durationSec);
       if (pure && pure.segments && pure.segments.length > 0) return pure;
-    }
-
-    if (parsed && Array.isArray(parsed.segments) && parsed.segments.length > 0) {
-      return parsed;
     }
 
     if (parsed && typeof parsed === 'object') {
@@ -1985,9 +2021,32 @@ app.post('/api/video/analyze-script', async (req, res) => {
             if (fs.existsSync(chunk3)) fs.unlinkSync(chunk3);
             if (fs.existsSync(concatList)) fs.unlinkSync(concatList);
           } catch {}
+        } else if (vidDuration > 180) {
+          // For 3-15 min videos: sample beginning, middle, and climax so the entire storyline's dialogue is captured
+          const midPoint = Math.max(30, Math.floor(vidDuration * 0.45));
+          const climaxPoint = Math.max(60, Math.floor(vidDuration * 0.8));
+          const chunk1 = path.join(uploadsDir, `c1-${Date.now()}.mp3`);
+          const chunk2 = path.join(uploadsDir, `c2-${Date.now()}.mp3`);
+          const chunk3 = path.join(uploadsDir, `c3-${Date.now()}.mp3`);
+          const concatList = path.join(uploadsDir, `list-${Date.now()}.txt`);
+
+          await execPromise(`ffmpeg -y -ss 0 -i "${localVideoFile}" -t 40 -vn -ab 48k -ar 16000 -ac 1 -f mp3 "${chunk1}"`);
+          await execPromise(`ffmpeg -y -ss ${midPoint} -i "${localVideoFile}" -t 40 -vn -ab 48k -ar 16000 -ac 1 -f mp3 "${chunk2}"`);
+          await execPromise(`ffmpeg -y -ss ${climaxPoint} -i "${localVideoFile}" -t 40 -vn -ab 48k -ar 16000 -ac 1 -f mp3 "${chunk3}"`);
+
+          fs.writeFileSync(concatList, `file '${chunk1}'\nfile '${chunk2}'\nfile '${chunk3}'\n`);
+          await execPromise(`ffmpeg -y -f concat -safe 0 -i "${concatList}" -c copy "${tmpAudio}"`);
+
+          try {
+            if (fs.existsSync(chunk1)) fs.unlinkSync(chunk1);
+            if (fs.existsSync(chunk2)) fs.unlinkSync(chunk2);
+            if (fs.existsSync(chunk3)) fs.unlinkSync(chunk3);
+            if (fs.existsSync(concatList)) fs.unlinkSync(concatList);
+          } catch {}
         } else {
-          const maxAudioDur = Math.min(120, Math.max(30, Math.round(vidDuration)));
-          await execPromise(`ffmpeg -y -i "${localVideoFile}" -t ${maxAudioDur} -vn -ab 64k -ar 16000 -ac 1 -f mp3 "${tmpAudio}"`);
+          // Short video <= 3 min: extract full audio
+          const maxAudioDur = Math.min(180, Math.max(10, Math.round(vidDuration)));
+          await execPromise(`ffmpeg -y -i "${localVideoFile}" -t ${maxAudioDur} -vn -ab 48k -ar 16000 -ac 1 -f mp3 "${tmpAudio}"`);
         }
 
         if (fs.existsSync(tmpAudio)) {
@@ -1999,7 +2058,7 @@ app.post('/api/video/analyze-script', async (req, res) => {
                 data: audioBuf.toString('base64'),
               },
             });
-            console.log(`[Fast-Pass Audio Streaming] Prepared ${formatBytes(audioBuf.length)} chunked MP3 audio for instant Gemini 2.5 Flash processing`);
+            console.log(`[Fast-Pass Audio Streaming] Prepared ${formatBytes(audioBuf.length)} chunked MP3 audio covering entire video timeline`);
           }
           try { fs.unlinkSync(tmpAudio); } catch {}
         }
@@ -2012,13 +2071,13 @@ app.post('/api/video/analyze-script', async (req, res) => {
         parts.push({
           inlineData: {
             mimeType: 'audio/mp3',
-            data: cleanAudio.length > 1200000 ? cleanAudio.slice(0, 1200000) : cleanAudio,
+            data: cleanAudio.length > 2000000 ? cleanAudio.slice(0, 2000000) : cleanAudio,
           },
         });
       }
     }
 
-    // Ingest visual frames for accurate visual scene analysis (Requirement 1)
+    // Ingest visual frames covering the entire video progression (start to finish)
     if (Array.isArray(frames) && frames.length > 0) {
       frames.slice(0, 10).forEach((frameData: any) => {
         const rawBase64 = typeof frameData === 'string'
@@ -2037,16 +2096,19 @@ app.post('/api/video/analyze-script', async (req, res) => {
     } else if (localVideoFile) {
       try {
         const vidDuration = Number(duration) || 90;
+        // Sample 7 keyframes evenly across the entire duration (5% to 95%) to capture every major plot beat
         const frameTimes = [
-          Math.max(1, Math.floor(vidDuration * 0.1)),
-          Math.max(2, Math.floor(vidDuration * 0.3)),
-          Math.max(3, Math.floor(vidDuration * 0.5)),
-          Math.max(4, Math.floor(vidDuration * 0.7)),
-          Math.max(5, Math.floor(vidDuration * 0.9)),
+          Math.max(0.5, Math.floor(vidDuration * 0.05)),
+          Math.max(1, Math.floor(vidDuration * 0.20)),
+          Math.max(2, Math.floor(vidDuration * 0.35)),
+          Math.max(3, Math.floor(vidDuration * 0.50)),
+          Math.max(4, Math.floor(vidDuration * 0.65)),
+          Math.max(5, Math.floor(vidDuration * 0.80)),
+          Math.max(6, Math.floor(vidDuration * 0.95)),
         ];
         for (let i = 0; i < frameTimes.length; i++) {
           const framePath = path.join(uploadsDir, `frame-${Date.now()}-${i}.jpg`);
-          await execPromise(`ffmpeg -y -ss ${frameTimes[i]} -i "${localVideoFile}" -vframes 1 -vf scale=480:-1 -q:v 3 "${framePath}"`);
+          await execPromise(`ffmpeg -y -ss ${frameTimes[i]} -i "${localVideoFile}" -vframes 1 -vf scale=640:-1 -q:v 3 "${framePath}"`);
           if (fs.existsSync(framePath)) {
             const buf = fs.readFileSync(framePath);
             if (buf.length > 100) {
@@ -2060,82 +2122,41 @@ app.post('/api/video/analyze-script', async (req, res) => {
             try { fs.unlinkSync(framePath); } catch {}
           }
         }
-        console.log(`[Gemini Multimodal] Extracted ${parts.filter((p) => p.inlineData?.mimeType === 'image/jpeg').length} visual keyframes from video file`);
+        console.log(`[Gemini Multimodal] Extracted ${parts.filter((p) => p.inlineData?.mimeType === 'image/jpeg').length} visual keyframes covering full video timeline`);
       } catch (fErr) {
         console.warn('Keyframe extraction warning:', fErr);
       }
     }
 
-    const systemInstruction = `You are an expert Burmese Movie Recap & Dubbing Script Generator.
+    const systemInstruction = `You are a master Burmese Cinema Recap Narrator & Dubbing Director.
 
-[STRICT RULES]
-1. NEVER start responses with generic template phrases such as "ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့...", "ဒီဗီဒီယိုမှာတော့...", "ဒီဗီဒီယိုထဲမှာတော့...", "ဒီဇာတ်လမ်းလေးကတော့...", "ပထမဦးစွာ ဇာတ်လမ်းအစမှာတော့...", or any standard intro text.
-2. Directly describe the action, character, or event shown in the visual scene immediately.
-3. Write script lines strictly in natural Burmese spoken language (မြန်မာစကားပြော အသုံးအနှုန်း).
-4. Do not invent details not visible in the frame. Keep commentary punchy, dramatic, and suited for movie recap clips.`;
+[CRITICAL: 100% VISUAL & AUDIO GROUNDING - ZERO HALLUCINATION]
+1. ZERO UNRELATED CONTENT: Every single sentence in your script MUST strictly describe the actual visible scene, actions, characters, and sounds in the provided video frames and audio.
+2. NEVER invent character names, backstories, outside movies, or fictional events not physically present in the frames or audio.
+3. ABSOLUTE PROHIBITION of generic template intro phrases:
+   - NEVER write "ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့..."
+   - NEVER write "ဒီဗီဒီယိုမှာတော့..."
+   - NEVER write "ဒီဗီဒီယိုထဲမှာတော့..."
+   - NEVER write "ဒီဇာတ်လမ်းလေးကတော့..."
+   - NEVER write "ပထမဦးစွာ ဇာတ်လမ်းအစမှာတော့..."
+   - NEVER write "ဒီရုပ်ရှင်ရဲ့ အဓိကဇာတ်ကွက်..."
+   Begin DIRECTLY with the real concrete action happening in the opening scene!
+4. COVER THE FULL VIDEO: Provide a detailed, scene-by-scene chronological narrative tracking the entire timeline from the earliest opening scenes to the final climax and resolution.
+5. Write strictly in natural spoken Burmese (မြန်မာစကားပြော အသုံးအနှုန်း) as used by professional movie recap narrators and dubbing artists.`;
 
-    // Streamlined prompt instructions for ultra-fast, high-impact response times (<3-5 seconds)
     const prompt = isCommentaryMode
-      ? `Task: Look at the visual frames and audio of "${cleanVideoTitle}" and generate a Burmese Movie Recap script.
-${instructions ? `Instructions: ${instructions}` : ''}
+      ? `CRITICAL TASK: Watch the video keyframes and listen to the audio track.
+Write a detailed, scene-by-scene Burmese Movie Recap narration script covering the full progression of the entire video.
+Video label: "${cleanVideoTitle}" (Duration: ~${duration} seconds).
+${instructions ? `User instructions: ${instructions}` : ''}
 
-[STRICT RULES]:
-1. NEVER start with generic template phrases ("ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့...", "ဒီဗီဒီယိုမှာတော့...", "ဒီဗီဒီယိုထဲမှာတော့...", "ဒီဇာတ်လမ်းလေးကတော့...").
-2. Directly describe the action, character, or event shown in the visual scene immediately.
-3. Write script lines strictly in natural Burmese spoken language (မြန်မာစကားပြော အသုံးအနှုန်း).
-4. Do not invent details not visible in the frame. Keep commentary punchy, dramatic, and suited for movie recap clips.
-5. Generate 3 to 5 punchy chronological narrative segments. All segments have speaker: '[Narrator] ဇာတ်လမ်းပြောသူ' and gender: 'narrator'.
+Ensure each segment details the specific visual actions and spoken dialogue from that scene. Do NOT output unrelated generic summaries. Track every scene chronologically from start to finish.`
+      : `CRITICAL TASK: Listen to the dialogue and watch the character interactions in the video keyframes and audio.
+Write natural spoken Burmese dubbing lines for the characters shown in the video.
+Video label: "${cleanVideoTitle}" (Duration: ~${duration} seconds).
+${instructions ? `User instructions: ${instructions}` : ''}
 
-Output strictly JSON:
-{
-  "videoTitle": "${cleanVideoTitle}",
-  "detectedLanguage": "Burmese",
-  "summary": "Direct punchy Burmese summary based on actual visual scene",
-  "segments": [
-    {
-      "id": 1,
-      "startSeconds": 0,
-      "endSeconds": 6.0,
-      "startTime": "00:00:00",
-      "endTime": "00:00:06",
-      "timestamp": "00:00 - 00:06",
-      "speaker": "[Narrator] ဇာတ်လမ်းပြောသူ",
-      "gender": "narrator",
-      "burmeseText": "မြင်ကွင်းထဲက အဖြစ်အပျက်ကို တိုက်ရိုက်ဖော်ပြသည့် မြန်မာစကားပြော စာကြောင်း"
-    }
-  ],
-  "fullBurmeseScript": "Complete continuous concise Burmese narration script directly describing the scene without template intro."
-}`
-      : `Task: Analyze the visual actions and dialogues in the frames of "${cleanVideoTitle}" and write natural spoken Burmese dubbing lines.
-${instructions ? `Instructions: ${instructions}` : ''}
-
-[STRICT RULES]:
-1. NEVER start responses with generic template phrases ("ဒီဇာတ်လမ်းစတင်ချိန်မှာတော့...", "ဒီဗီဒီယိုမှာတော့...", "ဒီဗီဒီယိုထဲမှာတော့...", "ဒီဇာတ်လမ်းလေးကတော့...").
-2. Directly describe the action, character, or event shown in the visual scene immediately.
-3. Write script lines strictly in natural Burmese spoken language (မြန်မာစကားပြော အသုံးအနှုန်း).
-4. Do not invent details not visible in the frame. Keep commentary punchy, dramatic, and suited for movie recap clips.
-5. Generate 3 to 5 punchy dialogue segments with natural Burmese spoken lines.
-
-Output strictly JSON:
-{
-  "videoTitle": "${cleanVideoTitle}",
-  "detectedLanguage": "Burmese",
-  "summary": "Direct punchy Burmese summary based on actual scene",
-  "segments": [
-    {
-      "id": 1,
-      "startSeconds": 0,
-      "endSeconds": 5.0,
-      "startTime": "00:00:00",
-      "endTime": "00:00:05",
-      "timestamp": "00:00 - 00:05",
-      "speaker": "[Male] Character",
-      "gender": "male",
-      "burmeseText": "သဘာဝကျကျ ကျစ်လျစ်သော မြန်မာစကားပြော စာကြောင်း"
-    }
-  ],
-  "fullBurmeseScript": "Combined concise full dialogue script in Burmese."
-};`;
+Ensure each dialogue segment strictly matches the character's emotion, words, and actions in that scene. Track every dialogue exchange chronologically.`;
 
     parts.push({ text: prompt });
 
@@ -2148,6 +2169,42 @@ Output strictly JSON:
         config: {
           systemInstruction,
           responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              videoTitle: { type: Type.STRING },
+              detectedLanguage: { type: Type.STRING },
+              summary: {
+                type: Type.STRING,
+                description: 'Accurate concise Burmese summary strictly describing the actual scenes and events in this specific video without template intros',
+              },
+              segments: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.INTEGER },
+                    startSeconds: { type: Type.NUMBER },
+                    endSeconds: { type: Type.NUMBER },
+                    startTime: { type: Type.STRING },
+                    endTime: { type: Type.STRING },
+                    timestamp: { type: Type.STRING },
+                    speaker: { type: Type.STRING },
+                    gender: { type: Type.STRING },
+                    visualDescription: { type: Type.STRING, description: 'Specific visible action, objects, environment, and characters in this scene' },
+                    burmeseText: { type: Type.STRING, description: 'Natural spoken Burmese narration or dialogue strictly about the events in this scene' },
+                  },
+                  required: ['id', 'startSeconds', 'endSeconds', 'startTime', 'endTime', 'speaker', 'burmeseText'],
+                },
+                description: 'Detailed chronological scene segments covering the full progression of the video',
+              },
+              fullBurmeseScript: {
+                type: Type.STRING,
+                description: 'Complete continuous natural Burmese narration script describing the full video sequence from start to finish',
+              },
+            },
+            required: ['videoTitle', 'summary', 'segments', 'fullBurmeseScript'],
+          },
           maxOutputTokens: 4096,
         },
       });
@@ -2166,53 +2223,51 @@ Output strictly JSON:
     if (!responseText || !responseText.trim()) {
       return res.status(500).json({
         success: false,
-        error: 'Gemini API Error: ဆာဗာမှ ဗီဒီယို Script ထွက်ရှိမလာပါ (Empty response)',
+        error: 'Gemini API Error: ဆာဗာမှ ဗီဒီယို Script ထွက်ရှိမလာပါ (Empty response from model)',
       });
     }
 
-    // Parse Gemini's actual response without falling back to placeholder text
+    // Parse Gemini's actual grounded response without inserting fake generic text
     let parsed = safeParseGeminiVideoAnalysis(responseText, cleanVideoTitle, duration, isCommentaryMode);
 
     if (!parsed || !parsed.segments || parsed.segments.length === 0) {
-      // Fallback gracefully to analyzing video title/metadata without throwing error
-      console.warn('[Gemini API] Primary parse yielded 0 segments; falling back gracefully to title & metadata synthesis');
-      const lines = responseText
-        .split('\n')
-        .map((l) => l.replace(/[{}\[\]",]/g, '').trim())
-        .filter((l) => l.length > 5 && !l.includes('http') && !l.startsWith('id:'));
+      console.warn('[Gemini API] Primary structured parse yielded 0 segments; attempting sentence extraction');
+      const burmeseMatches = responseText.match(/[\u1000-\u109F\s.,!?:;"'()၊။]{5,}/g) || [];
+      const cleanLines = burmeseMatches
+        .map((l) => cleanIntroCliches(l.trim()))
+        .filter((l) => l.length > 5 && !/^(id|timestamp|speaker|gender|startSeconds|endSeconds)/i.test(l));
 
-      const fallbackSegments = [
-        {
-          id: 1,
-          startSeconds: 0,
-          endSeconds: Math.min(10, Math.floor(duration / 2)),
-          startTime: '00:00:00',
-          endTime: '00:00:10',
-          timestamp: '00:00 - 00:10',
-          speaker: isCommentaryMode ? '[Narrator] ဇာတ်လမ်းပြောသူ' : 'ဇာတ်ကောင်',
-          gender: isCommentaryMode ? 'narrator' : 'male',
-          burmeseText: lines[0] || `${cleanVideoTitle} ရဲ့ အဓိကဇာတ်ကွက်များနှင့် လျှို့ဝှက်ချက်များကို စတင်ဖော်ထုတ်ကြည့်ရှုကြပါမည်။`,
-        },
-        {
-          id: 2,
-          startSeconds: Math.min(10, Math.floor(duration / 2)),
-          endSeconds: duration,
-          startTime: '00:00:10',
-          endTime: '00:00:30',
-          timestamp: '00:10 - 00:30',
-          speaker: isCommentaryMode ? '[Narrator] ဇာတ်လမ်းပြောသူ' : 'ဇာတ်ကောင်',
-          gender: isCommentaryMode ? 'narrator' : 'male',
-          burmeseText: lines[1] || `${cleanVideoTitle} ဇာတ်ကား၏ မျှော်လင့်မထားသော အလှည့်အပြောင်းနှင့် စိတ်လှုပ်ရှားဖွယ် ဇာတ်သိမ်းပိုင်း။`,
-        },
-      ];
+      if (cleanLines.length > 0) {
+        const segDur = Math.max(3, Math.round((duration / cleanLines.length) * 10) / 10);
+        const dynamicSegments = cleanLines.map((line, idx) => {
+          const s = Math.round(idx * segDur * 10) / 10;
+          const e = Math.round(Math.min(duration, s + segDur) * 10) / 10;
+          return {
+            id: idx + 1,
+            startSeconds: s,
+            endSeconds: e,
+            startTime: formatSecondsToTime(s),
+            endTime: formatSecondsToTime(e),
+            timestamp: `${formatSecondsToTime(s)} - ${formatSecondsToTime(e)}`,
+            speaker: isCommentaryMode ? '[Narrator] ဇာတ်လမ်းပြောသူ' : 'ဇာတ်ကောင်',
+            gender: isCommentaryMode ? 'narrator' : 'male',
+            burmeseText: line,
+          };
+        });
 
-      parsed = {
-        videoTitle: cleanVideoTitle,
-        detectedLanguage: 'Burmese',
-        summary: lines[0] || `${cleanVideoTitle} ဇာတ်လမ်းအကျဉ်းနှင့် ဇာတ်ညွှန်း`,
-        segments: fallbackSegments,
-        fullBurmeseScript: fallbackSegments.map((s) => s.burmeseText).join(' '),
-      };
+        parsed = {
+          videoTitle: cleanVideoTitle,
+          detectedLanguage: 'Burmese',
+          summary: cleanLines[0],
+          segments: dynamicSegments,
+          fullBurmeseScript: cleanLines.join(' '),
+        };
+      } else {
+        return res.status(500).json({
+          success: false,
+          error: 'Gemini မော်ဒယ်မှ သက်ဆိုင်ရာ မြန်မာဇာတ်ညွှန်းကို ထုတ်ယူ၍ မရရှိခဲ့ပါ။ ဗီဒီယိုဖိုင်အား စစ်ဆေးပြီး ပြန်လည်စမ်းသပ်ပေးပါ။',
+        });
+      }
     }
 
     return res.json({

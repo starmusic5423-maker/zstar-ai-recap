@@ -57,9 +57,12 @@ import {
   Italic as ItalicIcon,
   Type,
   RotateCcw,
+  BookOpen,
+  Video,
+  Lightbulb,
 } from 'lucide-react';
 import { jsPDF } from 'jspdf';
-import { MovieRecap, SampledFrame, SubtitleCue, AudioTranscriptionResult, TranscriptSegment, VoiceoverNarrationGuide, SplitVideoResult, ProcessedVideoSegment } from '../types';
+import { MovieRecap, SampledFrame, SubtitleCue, AudioTranscriptionResult, TranscriptSegment, VoiceoverNarrationGuide, SplitVideoResult, ProcessedVideoSegment, MovieSummary } from '../types';
 import { extractAudioFromVideoFile } from '../utils/audioExtractor';
 import { VoiceoverGeneratorModule } from './VoiceoverGeneratorModule';
 import { CustomDarkDropdown, DropdownOption } from './CustomDarkDropdown';
@@ -446,6 +449,15 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
   const [isLoadingVoiceoverGuide, setIsLoadingVoiceoverGuide] = useState(false);
   const [studioSubTab, setStudioSubTab] = useState<'analyzedScript' | 'voiceoverGuide' | 'recap'>('analyzedScript');
 
+  // AI-Powered Movie Title Summarizer states
+  const [movieSummaryInput, setMovieSummaryInput] = useState('');
+  const [movieSummaryLanguage, setMovieSummaryLanguage] = useState<'burmese' | 'english' | 'dual'>('burmese');
+  const [movieSummaryLength, setMovieSummaryLength] = useState<'short' | 'detailed'>('short');
+  const [isSummarizingMovie, setIsSummarizingMovie] = useState(false);
+  const [movieSummaryResult, setMovieSummaryResult] = useState<MovieSummary | null>(null);
+  const [movieSummaryError, setMovieSummaryError] = useState<string | null>(null);
+  const [step1SubTab, setStep1SubTab] = useState<'video' | 'movieSummarizer'>('video');
+
   // Video Audio Speech-to-Text Transcription states
   const [transcriptionResult, setTranscriptionResult] = useState<AudioTranscriptionResult | null>(null);
   const [isTranscribing, setIsTranscribing] = useState(false);
@@ -779,12 +791,12 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     return str;
   };
 
-  // Helper to validate whether a key string looks like a legitimate API key (not an internal AQ. access token or placeholder)
+  // Helper to validate whether a key string looks like a usable API key without strict regex, length, or prefix checks
   const isKeyFormatValid = (k?: string | null): boolean => {
     if (!k) return false;
     const str = sanitizeApiKey(k);
-    if (!str || str.length < 15) return false;
-    if (/^(your_gemini_api_key_here|your_api_key|undefined|null|placeholder|gemini_api_key|vite_gemini_api_key|api_key|custom_gemini_api_key)$/i.test(str)) return false;
+    if (!str || str.trim().length < 20) return false; // Valid Google AI Studio Gemini API keys are 39 chars long
+    if (/^(your_gemini_api_key_here|your_api_key|undefined|null|placeholder|gemini_api_key|vite_gemini_api_key|api_key|key)$/i.test(str.trim())) return false;
     if (str.startsWith('AQ.')) return false; // Ignore internal GCP access tokens
     return true;
   };
@@ -1083,7 +1095,7 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     return () => clearTimeout(timer);
   }, []);
 
-  // Smooth retry mechanism with exponential backoff specifically for 503 Service Unavailable errors
+  // Smooth retry mechanism with exponential backoff specifically for 503 Service Unavailable and 429 Rate Limit errors
   const fetchWith503Retry = async (
     url: string,
     options: RequestInit,
@@ -1098,8 +1110,8 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
       try {
         const res = await fetch(url, options);
 
-        // If 503 Service Unavailable, inspect and retry with exponential backoff
-        if (res.status === 503 && attempt < maxRetries) {
+        // If 503 Service Unavailable or 429 Rate Limit, inspect and retry with exponential backoff
+        if ((res.status === 503 || res.status === 429) && attempt < maxRetries) {
           attempt++;
           if (onRetryStatus) {
             onRetryStatus(attempt, delay);
@@ -1116,8 +1128,8 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
           throw networkErr;
         }
         const msg = String(networkErr?.message || networkErr || '').toLowerCase();
-        const is503Like = msg.includes('503') || msg.includes('service unavailable');
-        if (is503Like && attempt < maxRetries) {
+        const isRetryable = msg.includes('503') || msg.includes('service unavailable') || msg.includes('429') || msg.includes('rate limit');
+        if (isRetryable && attempt < maxRetries) {
           attempt++;
           if (onRetryStatus) {
             onRetryStatus(attempt, delay);
@@ -1806,8 +1818,8 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
         ? video.duration
         : (duration || 240);
 
-      // Exactly maximum 5 keyframes evenly spaced across the video duration
-      const targetCount = Math.min(5, Math.max(2, requestedCount || 5));
+      // Extract keyframes evenly spaced across the entire video duration (beginning to ending)
+      const targetCount = Math.min(7, Math.max(3, requestedCount || 6));
       const frames: SampledFrame[] = [];
       const step = vidDuration / (targetCount + 1);
 
@@ -2105,6 +2117,118 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
     return str.trim();
   };
 
+  // AI-Powered Movie Title Summarization Handler
+  const handleSummarizeMovie = async (customTitle?: string) => {
+    const titleToSummarize = (customTitle || movieSummaryInput).trim();
+    if (!titleToSummarize) {
+      setMovieSummaryError('ရုပ်ရှင်အမည် ထည့်သွင်းပေးပါ (Please enter a movie title)');
+      return;
+    }
+
+    setMovieSummaryError(null);
+    setIsSummarizingMovie(true);
+
+    try {
+      let activeApiKey = getActiveGeminiApiKey();
+      if (!activeApiKey) {
+        try {
+          const keyRes = await fetch('/api/gemini/get-key');
+          if (keyRes.ok) {
+            const keyData = await keyRes.json();
+            if (keyData?.hasKey && keyData?.key && isKeyFormatValid(keyData.key)) {
+              activeApiKey = sanitizeApiKey(keyData.key);
+              moduleActiveGeminiKey = activeApiKey;
+              verifiedKeyRef.current = activeApiKey;
+              handleUpdateApiKey(activeApiKey);
+            }
+          }
+        } catch (_) {}
+      }
+
+      const res = await fetchWith503Retry(
+        '/api/movie/summarize',
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            movieTitle: titleToSummarize,
+            language: movieSummaryLanguage,
+            length: movieSummaryLength,
+            apiKey: activeApiKey,
+          }),
+        },
+        (retryCount, delay) => {
+          console.log(`Retrying movie summary (attempt ${retryCount}, waiting ${delay}ms)...`);
+        },
+        3,
+        1500
+      );
+
+      const data = await res.json();
+      if (!res.ok || !data.success) {
+        throw new Error(data.error || 'Movie summarization failed. Please check your API key or network.');
+      }
+
+      setMovieSummaryResult(data.summary);
+      if (data.summary.movieTitle && !videoTitle) {
+        setVideoTitle(data.summary.movieTitle);
+      }
+    } catch (err: any) {
+      setMovieSummaryError(err?.message || 'ရုပ်ရှင်အနှစ်ချုပ် ထုတ်ယူရာတွင် အမှားတစ်ခု ဖြစ်ပေါ်ခဲ့ပါသည်။');
+    } finally {
+      setIsSummarizingMovie(false);
+    }
+  };
+
+  // Bridge Movie Summary directly to Step 2 Script & Voiceover Studio
+  const handleUseMovieSummaryInStudio = (summary: MovieSummary) => {
+    const displayTitle = summary.burmeseTitle ? `${summary.movieTitle} (${summary.burmeseTitle})` : summary.movieTitle;
+    setVideoTitle(displayTitle);
+
+    const scriptText = summary.burmeseSummary || summary.mainPlot || summary.shortSummary;
+    setEditableScriptText(scriptText);
+
+    // Create segments for voiceover actor guidance
+    const sentences = scriptText.split(/[။\n.]+/).filter((s: string) => s.trim().length > 3);
+    const generatedSegments = sentences.map((sentence: string, idx: number) => {
+      const sSec = idx * 6;
+      const eSec = sSec + 5;
+      const fmt = (sec: number) => {
+        const m = Math.floor(sec / 60);
+        const s = sec % 60;
+        return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+      };
+      return {
+        id: idx + 1,
+        startTime: fmt(sSec),
+        endTime: fmt(eSec),
+        startSeconds: sSec,
+        endSeconds: eSec,
+        speaker: 'ဇာတ်လမ်းပြောသူ',
+        gender: 'narrator',
+        originalText: sentence.trim(),
+        burmeseText: sentence.trim(),
+      };
+    });
+
+    setAnalyzedScriptResult({
+      videoTitle: displayTitle,
+      detectedLanguage: 'Burmese',
+      summary: summary.shortSummary,
+      segments: generatedSegments,
+      fullBurmeseScript: scriptText,
+    });
+
+    // Switch smoothly to Step 2: Script & Voiceover
+    setActiveStep(2);
+    setStudioActiveMode('recap');
+    setStudioSubTab('analyzedScript');
+
+    try {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } catch (_) {}
+  };
+
   // Video-to-Script Multimodal Video & Audio Analysis with Real-time Active Progress
   const handleAnalyzeVideo = async () => {
     // 1. Immediately clear old error state so UI unfreezes on every click
@@ -2178,18 +2302,17 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
         framesToSend = sampledFrames
           .map((f) => f.dataUrl)
           .filter((url) => url && url.startsWith('data:image/jpeg;base64,') && url.length > 400)
-          .slice(0, 5);
+          .slice(0, 7);
       } else if (videoRef.current) {
         try {
-          const extracted = await sampleFramesFromVideo(5);
+          const extracted = await sampleFramesFromVideo(7);
           if (extracted && extracted.length > 0) {
             framesToSend = extracted
               .map((f) => f.dataUrl)
               .filter((url) => url && url.startsWith('data:image/jpeg;base64,') && url.length > 400)
-              .slice(0, 5);
+              .slice(0, 7);
           }
         } catch (frameErr: any) {
-          // Gracefully fallback to analyzing video title / metadata without throwing error
           console.warn('Frame sampling caught warning in handleAnalyzeVideo, falling back gracefully to title/metadata:', frameErr);
         }
       }
@@ -2198,7 +2321,7 @@ export const ZStarRecapStudio: React.FC<ZStarRecapStudioProps> = ({
       let audioBase64 = '';
       if (!serverVideoPath && videoFile) {
         try {
-          const audioRes = await extractAudioFromVideoFile(videoFile, 60);
+          const audioRes = await extractAudioFromVideoFile(videoFile, 90);
           audioBase64 = audioRes.base64;
         } catch (audioErr) {
           console.warn('Audio extraction warning:', audioErr);
@@ -4648,9 +4771,41 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
             </div>
           </div>
 
+          {/* Step 1 Workflow Mode Tabs: Video Ingest vs Movie Title Summarizer */}
+          <div className="flex items-center gap-2 p-1.5 rounded-2xl bg-slate-950/80 border border-slate-800">
+            <button
+              type="button"
+              onClick={() => setStep1SubTab('video')}
+              className={`flex-1 py-2.5 px-4 rounded-xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                step1SubTab === 'video'
+                  ? 'bg-gradient-to-r from-cyan-500/20 to-blue-500/20 text-cyan-300 border border-cyan-500/50 shadow-md'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
+              }`}
+            >
+              <Video className="w-4 h-4 text-cyan-400" />
+              <span>Video File Analysis (ဗီဒီယို ဖိုင်တင်မည်)</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setStep1SubTab('movieSummarizer')}
+              className={`flex-1 py-2.5 px-4 rounded-xl font-bold text-xs sm:text-sm flex items-center justify-center gap-2 transition-all cursor-pointer ${
+                step1SubTab === 'movieSummarizer'
+                  ? 'bg-gradient-to-r from-pink-500/20 to-purple-500/20 text-pink-300 border border-pink-500/50 shadow-md'
+                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900/50'
+              }`}
+            >
+              <BookOpen className="w-4 h-4 text-pink-400" />
+              <span>AI Movie Summarizer (ရုပ်ရှင်အမည်ဖြင့် အနှစ်ချုပ်)</span>
+              <span className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-pink-500/20 text-pink-300 border border-pink-500/40">
+                Plot • Cast • Recap
+              </span>
+            </button>
+          </div>
+
           {/* Video Dropzone / File Picker */}
-          <div className="space-y-4">
-            <input
+          {step1SubTab === 'video' && (
+            <div className="space-y-4">
+              <input
               type="file"
               ref={fileInputRef}
               onChange={handleFileChange}
@@ -5239,6 +5394,360 @@ Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
                 </div>
               )}
             </div>
+          )}
+
+          {/* ============================================================= */}
+          {/* AI MOVIE SUMMARIZER SECTION (Plot, Characters, Themes & Recap) */}
+          {/* ============================================================= */}
+          {step1SubTab === 'movieSummarizer' && (
+            <div className="space-y-6 animate-fadeIn">
+              {/* Movie Title Input Card */}
+              <div className="bg-[#070d18] border border-pink-500/30 rounded-3xl p-5 sm:p-7 shadow-2xl space-y-5">
+                <div className="flex items-center justify-between pb-3 border-b border-slate-800">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-pink-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black shadow-lg shadow-pink-500/30">
+                      <BookOpen className="w-5 h-5" />
+                    </div>
+                    <div>
+                      <h3 className="font-black text-base sm:text-lg text-white">
+                        AI-Powered Movie Summarization
+                      </h3>
+                      <p className="text-xs text-slate-400">
+                        မည်သည့် ရုပ်ရှင်အမည်ကိုမဆို ထည့်သွင်းရုံဖြင့် အဓိက ဇာတ်ကွက် (Plot)၊ ဇာတ်ကောင်များ (Characters)၊ အတွေးအခေါ် (Themes) နှင့် မြန်မာစကားပြော Recap ဇာတ်ညွှန်းကို ချက်ချင်းထုတ်ပေးပါမည်။
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Search Bar */}
+                <div className="space-y-2">
+                  <label htmlFor="movie-title-input" className="text-xs font-mono font-bold text-pink-300 flex items-center gap-1.5">
+                    <Film className="w-4 h-4 text-pink-400" />
+                    <span>MOVIE TITLE (ရုပ်ရှင်အမည်)</span>
+                  </label>
+                  <div className="flex flex-col sm:flex-row gap-2">
+                    <input
+                      id="movie-title-input"
+                      type="text"
+                      value={movieSummaryInput}
+                      onChange={(e) => setMovieSummaryInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter' && !isSummarizingMovie && movieSummaryInput.trim()) {
+                          handleSummarizeMovie();
+                        }
+                      }}
+                      placeholder="e.g. Interstellar, Inception, Titanic, Oppenheimer, The Dark Knight, Spirited Away, Parasite..."
+                      className="flex-1 bg-slate-950/80 border border-slate-700 focus:border-pink-500 rounded-2xl px-4 py-3 text-sm text-white placeholder-slate-500 outline-none transition-all shadow-inner"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleSummarizeMovie()}
+                      disabled={isSummarizingMovie || !movieSummaryInput.trim()}
+                      className="px-6 py-3 rounded-2xl bg-gradient-to-r from-pink-500 via-rose-500 to-purple-600 hover:from-pink-400 hover:to-purple-500 disabled:opacity-40 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-pink-500/30 cursor-pointer transition-all shrink-0 hover:scale-105 active:scale-95"
+                    >
+                      {isSummarizingMovie ? (
+                        <>
+                          <Loader2 className="w-4 h-4 animate-spin" />
+                          <span>Generating Summary...</span>
+                        </>
+                      ) : (
+                        <>
+                          <Sparkles className="w-4 h-4" />
+                          <span>Generate Summary</span>
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+
+                {/* Quick Movie Suggestions */}
+                <div className="space-y-1.5">
+                  <div className="text-[11px] font-mono text-slate-400 flex items-center gap-1">
+                    <span>💡 အမြန်စမ်းသပ်ရန် ရုပ်ရှင်များ:</span>
+                  </div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    {['Interstellar', 'Inception', 'The Dark Knight', 'Titanic', 'Oppenheimer', 'Spirited Away', 'Parasite', 'Avengers: Endgame'].map((m) => (
+                      <button
+                        key={m}
+                        type="button"
+                        onClick={() => {
+                          setMovieSummaryInput(m);
+                          handleSummarizeMovie(m);
+                        }}
+                        className="px-3 py-1 rounded-xl text-xs font-mono font-medium bg-slate-900/90 hover:bg-pink-950/40 text-slate-300 hover:text-pink-300 border border-slate-800 hover:border-pink-500/40 cursor-pointer transition-all"
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Options: Language & Length */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t border-slate-800/80">
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-mono font-bold text-slate-300 flex items-center gap-1.5">
+                      <Languages className="w-3.5 h-3.5 text-pink-400" />
+                      <span>Language (ဘာသာစကား)</span>
+                    </label>
+                    <div className="flex rounded-xl bg-slate-950 p-1 border border-slate-800">
+                      {[
+                        { id: 'burmese', label: 'Burmese (မြန်မာ)' },
+                        { id: 'english', label: 'English' },
+                        { id: 'dual', label: 'Dual (မြန်မာ + En)' },
+                      ].map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setMovieSummaryLanguage(opt.id as any)}
+                          className={`flex-1 py-1.5 px-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                            movieSummaryLanguage === opt.id
+                              ? 'bg-pink-500/20 text-pink-300 border border-pink-500/40'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-mono font-bold text-slate-300 flex items-center gap-1.5">
+                      <Clock className="w-3.5 h-3.5 text-pink-400" />
+                      <span>Summary Depth (အကျဉ်း/အကျယ်)</span>
+                    </label>
+                    <div className="flex rounded-xl bg-slate-950 p-1 border border-slate-800">
+                      {[
+                        { id: 'short', label: 'Short & Punchy (ထိမိတိုရှင်း)' },
+                        { id: 'detailed', label: 'Detailed (အသေးစိတ်ခွဲခြမ်းမှု)' },
+                      ].map((opt) => (
+                        <button
+                          key={opt.id}
+                          type="button"
+                          onClick={() => setMovieSummaryLength(opt.id as any)}
+                          className={`flex-1 py-1.5 px-2 rounded-lg text-xs font-bold transition-all cursor-pointer ${
+                            movieSummaryLength === opt.id
+                              ? 'bg-pink-500/20 text-pink-300 border border-pink-500/40'
+                              : 'text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          {opt.label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* Movie Summary Error Banner */}
+                {movieSummaryError && (
+                  <div className="p-4 rounded-2xl bg-rose-950/40 border border-rose-500/40 text-xs text-rose-200 flex items-center justify-between gap-2 shadow-lg animate-fadeIn">
+                    <div className="flex items-center gap-2">
+                      <AlertCircle className="w-4 h-4 text-rose-400 shrink-0" />
+                      <span>{movieSummaryError}</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setMovieSummaryError(null)}
+                      className="text-rose-400 hover:text-rose-200 p-1"
+                    >
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                )}
+              </div>
+
+              {/* Movie Summary Result Card */}
+              {movieSummaryResult && (
+                <div className="bg-[#080e1c] border-2 border-pink-500/50 rounded-3xl p-5 sm:p-7 shadow-2xl shadow-pink-950/60 space-y-6 animate-fadeIn">
+                  {/* Result Header */}
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
+                    <div className="flex items-start gap-3">
+                      <div className="w-12 h-12 rounded-2xl bg-gradient-to-br from-pink-500 via-rose-500 to-purple-600 flex items-center justify-center text-white font-black shadow-lg shadow-pink-500/30 shrink-0">
+                        <Film className="w-6 h-6" />
+                      </div>
+                      <div>
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <h3 className="font-black text-lg sm:text-xl text-white">
+                            {movieSummaryResult.movieTitle}
+                          </h3>
+                          {movieSummaryResult.burmeseTitle && (
+                            <span className="text-pink-300 text-sm font-bold bg-pink-950/70 px-2 py-0.5 rounded-lg border border-pink-800/80">
+                              {movieSummaryResult.burmeseTitle}
+                            </span>
+                          )}
+                          {movieSummaryResult.releaseYear && (
+                            <span className="text-xs font-mono font-bold text-slate-400 bg-slate-900 px-2 py-0.5 rounded border border-slate-800">
+                              {movieSummaryResult.releaseYear}
+                            </span>
+                          )}
+                        </div>
+                        {movieSummaryResult.tagline && (
+                          <p className="text-xs italic text-pink-200/90 mt-1 font-serif">
+                            "{movieSummaryResult.tagline}"
+                          </p>
+                        )}
+                        {movieSummaryResult.genre && movieSummaryResult.genre.length > 0 && (
+                          <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                            {movieSummaryResult.genre.map((g, idx) => (
+                              <span
+                                key={idx}
+                                className="px-2 py-0.5 rounded-md text-[10px] font-mono font-bold bg-purple-950/60 text-purple-300 border border-purple-800/60"
+                              >
+                                {g}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Top Action Buttons */}
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const textToCopy = `🎬 ${movieSummaryResult.movieTitle} (${movieSummaryResult.burmeseTitle || ''})\n\n📌 Quick Summary:\n${movieSummaryResult.shortSummary}\n\n📖 Main Plot:\n${movieSummaryResult.mainPlot}\n\n🎙️ Burmese Recap Script:\n${movieSummaryResult.burmeseSummary}`;
+                          navigator.clipboard?.writeText(textToCopy);
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold border border-slate-700 flex items-center gap-1.5 cursor-pointer transition-all"
+                      >
+                        <Copy className="w-3.5 h-3.5 text-slate-400" />
+                        <span>Copy Summary</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const blob = new Blob([movieSummaryResult.burmeseSummary], { type: 'text/plain;charset=utf-8' });
+                          const url = URL.createObjectURL(blob);
+                          const a = document.createElement('a');
+                          a.href = url;
+                          a.download = `${movieSummaryResult.movieTitle.replace(/\s+/g, '_')}_burmese_recap.txt`;
+                          a.click();
+                          URL.revokeObjectURL(url);
+                        }}
+                        className="px-3 py-1.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-slate-300 text-xs font-bold border border-slate-700 flex items-center gap-1.5 cursor-pointer transition-all"
+                      >
+                        <Download className="w-3.5 h-3.5 text-slate-400" />
+                        <span>Download Script</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* 1. Quick Summary */}
+                  {movieSummaryResult.shortSummary && (
+                    <div className="p-4 rounded-2xl bg-slate-900/70 border border-slate-800 space-y-1">
+                      <span className="text-[11px] font-mono font-bold text-pink-400 uppercase tracking-wider">
+                        ⚡ Quick Pitch / Summary
+                      </span>
+                      <p className="text-sm text-slate-200 leading-relaxed">
+                        {movieSummaryResult.shortSummary}
+                      </p>
+                    </div>
+                  )}
+
+                  {/* 2. Main Plot */}
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-xs font-mono font-bold text-cyan-300 uppercase tracking-wider">
+                      <Film className="w-4 h-4 text-cyan-400" />
+                      <span>Main Plot (အဓိက ဇာတ်ကွက် အကျဉ်း)</span>
+                    </div>
+                    <div className="p-4 rounded-2xl bg-slate-950/80 border border-slate-800/90 text-sm text-slate-200 leading-relaxed font-sans whitespace-pre-line">
+                      {movieSummaryResult.mainPlot}
+                    </div>
+                  </div>
+
+                  {/* 3. Characters */}
+                  {movieSummaryResult.characters && movieSummaryResult.characters.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2 text-xs font-mono font-bold text-amber-300 uppercase tracking-wider">
+                        <Users className="w-4 h-4 text-amber-400" />
+                        <span>Key Characters (အဓိက ဇာတ်ကောင်များနှင့် အခန်းကဏ္ဍ)</span>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {movieSummaryResult.characters.map((char, cIdx) => (
+                          <div
+                            key={cIdx}
+                            className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-1.5"
+                          >
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <span className="font-bold text-sm text-white">
+                                {char.name}
+                              </span>
+                              <span className="text-[10px] font-mono font-bold px-2 py-0.5 rounded-md bg-amber-950/60 text-amber-300 border border-amber-800/60">
+                                {char.role}
+                              </span>
+                            </div>
+                            <p className="text-xs text-slate-300 leading-relaxed">
+                              {char.description}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 4. Themes */}
+                  {movieSummaryResult.themes && movieSummaryResult.themes.length > 0 && (
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2 text-xs font-mono font-bold text-emerald-300 uppercase tracking-wider">
+                        <Lightbulb className="w-4 h-4 text-emerald-400" />
+                        <span>Core Themes & Ideas (အဓိက အတွေးအခေါ်နှင့် သဘောတရား)</span>
+                      </div>
+                      <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                        {movieSummaryResult.themes.map((th, tIdx) => (
+                          <div
+                            key={tIdx}
+                            className="p-3.5 rounded-2xl bg-slate-950/70 border border-slate-800 space-y-1"
+                          >
+                            <span className="font-bold text-sm text-emerald-300">
+                              💡 {th.name}
+                            </span>
+                            <p className="text-xs text-slate-300 leading-relaxed">
+                              {th.description}
+                            </p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* 5. Engaging Burmese Spoken Recap Script */}
+                  {movieSummaryResult.burmeseSummary && (
+                    <div className="space-y-2 pt-2 border-t border-slate-800">
+                      <div className="flex items-center justify-between gap-2 flex-wrap">
+                        <div className="flex items-center gap-2 text-xs font-mono font-bold text-pink-300 uppercase tracking-wider">
+                          <Mic className="w-4 h-4 text-pink-400" />
+                          <span>Engaging Burmese Recap Script (မြန်မာစကားပြော အနှစ်ချုပ် ဇာတ်ညွှန်း)</span>
+                        </div>
+                        <span className="text-[10px] font-mono text-slate-400">
+                          {movieSummaryResult.burmeseSummary.length} characters
+                        </span>
+                      </div>
+                      <div className="p-4 rounded-2xl bg-[#060c18] border border-pink-500/30 text-sm text-pink-100/90 leading-relaxed font-sans whitespace-pre-line shadow-inner max-h-72 overflow-y-auto">
+                        {movieSummaryResult.burmeseSummary}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* Bridge Action to Step 2 Voiceover Studio */}
+                  <div className="pt-3 flex flex-col sm:flex-row items-center justify-between gap-3 border-t border-slate-800/80">
+                    <div className="text-xs text-slate-400 flex items-center gap-1.5">
+                      <span className="text-pink-400 font-bold">✨</span>
+                      <span>ဤဇာတ်ညွှန်းဖြင့် Step 2 တွင် မြန်မာ AI Voiceover အသံချက်ချင်းထုတ်ယူနိုင်ပါသည်</span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => handleUseMovieSummaryInStudio(movieSummaryResult)}
+                      className="w-full sm:w-auto px-6 py-3 rounded-2xl bg-gradient-to-r from-pink-500 via-rose-500 to-purple-600 hover:from-pink-400 hover:to-purple-500 text-white font-black text-xs sm:text-sm flex items-center justify-center gap-2 shadow-lg shadow-pink-500/30 cursor-pointer transition-all hover:scale-105 active:scale-95"
+                    >
+                      <Mic className="w-4 h-4" />
+                      <span>Use Script in Voiceover Studio (Step 2) →</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Step 1 Bottom Navigation Control */}
           <div className="flex items-center justify-end pt-4 border-t border-slate-800">
